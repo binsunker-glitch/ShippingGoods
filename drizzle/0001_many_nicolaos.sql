@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX "claim_open_shipment_uq" ON "shipment_claim_requests" USING btree ("shipment_id") WHERE shipment_id IS NOT NULL AND request_status IN ('pending', 'auto_verified', 'approved');--> statement-breakpoint
+CREATE UNIQUE INDEX "claim_open_customer_shipment_uq" ON "shipment_claim_requests" USING btree ("customer_id","shipment_id") WHERE shipment_id IS NOT NULL AND request_status IN ('pending', 'auto_verified');

@@ -1,0 +1,160 @@
+@import "tailwindcss";
+
+/* ============================================================
+   World Associates Shipping CO — design tokens
+   ============================================================ */
+
+@theme {
+  --font-sans:
+    "IBM Plex Sans Arabic", "IBM Plex Sans", "Segoe UI", Tahoma, "Arial",
+    sans-serif;
+
+  /* surfaces */
+  --color-canvas: #f3f5f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8fafc;
+
+  /* text */
+  --color-ink: #0e1726;
+  --color-muted: #667085;
+  --color-subtle: #98a2b3;
+  --color-line: #e4e8ef;
+  --color-line-strong: #d3d9e3;
+
+  /* brand */
+  --color-navy: #0b1b33;
+  --color-navy-soft: #132743;
+  --color-navy-line: #1d3557;
+  --color-brand: #f97316;
+  --color-brand-dark: #ea580c;
+  --color-brand-soft: #fff3e8;
+
+  /* semantic */
+  --color-success: #0e9f6e;
+  --color-success-soft: #e8f7f2;
+  --color-warning: #d97706;
+  --color-warning-soft: #fff7e8;
+  --color-danger: #dc2626;
+  --color-danger-soft: #fdecec;
+  --color-info: #0b69c7;
+  --color-info-soft: #e9f2fd;
+  --color-violet: #6d4aff;
+  --color-violet-soft: #f0ecff;
+
+  /* shape + elevation */
+  --radius-card: 1rem;
+  --shadow-soft:
+    0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 20px -12px rgba(16, 24, 40, 0.18);
+  --shadow-card: 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-pop: 0 12px 32px -12px rgba(16, 24, 40, 0.28);
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--color-brand-soft);
+  color: var(--color-brand-dark);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  letter-spacing: -0.01em;
+}
+
+/* Numbers inside RTL text keep their direction predictable. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  unicode-bidi: isolate;
+}
+
+/* Scrollbars: thin and neutral so tables stay calm. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* ============================================================
+   Utilities
+   ============================================================ */
+
+@utility skeleton-fill {
+  background: linear-gradient(
+    90deg,
+    #eef1f6 25%,
+    #f7f9fc 37%,
+    #eef1f6 63%
+  );
+  background-size: 400% 100%;
+  animation: wa-shimmer 1.4s ease infinite;
+}
+
+@keyframes wa-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+@utility no-scrollbar {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Shipping label printing: only the label sheet is printed. */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible;
+  }
+  .print-area {
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+    width: 100%;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

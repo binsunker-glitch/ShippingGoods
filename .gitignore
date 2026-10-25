@@ -1,0 +1,36 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# local database (embedded PGlite) — never commit data
+/.data
+
+# file uploads — never commit customer documents
+/uploads
+
+# environment (secrets) — only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+*.pem
+*.tsbuildinfo
+.vercel
+
+# debug
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# tests / tooling
+/coverage
