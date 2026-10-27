@@ -1,12 +1,12 @@
-# World Associates Shipping CO — نظام الشحن (Arabic RTL)
+# World Associates Shipping CO — منصة الشحن (Arabic RTL)
 
-منصة شحن كاملة باللغة العربية (RTL) لشركة **World Associates Shipping CO** لشحن المشتريات من
-مستودع قوانغتشو (الصين) إلى المملكة العربية السعودية: موقع عام، تسجيل ودخول، لوحة العميل،
-ربط وتتبع الشحنات، عناوين، مدفوعات، إشعارات، دعم فني — بالإضافة إلى **لوحة إدارة** بتقسيم
-صلاحيات حسب الدور.
+A complete Arabic RTL shipping & logistics platform: a **customer portal**
+(shipments, warehouse packages, consolidation, claims, support) and an
+**operations/admin console** (shipments, warehouse, claims, tickets, payments,
+customers, status matrix, audit log) for **Guangzhou, China → KSA** freight.
 
-> This README is a developer/setup guide. The product UI itself is 100 % Arabic RTL
-> (`dir="rtl"`, timezone `Asia/Riyadh`, currency `SAR`).
+> This README is a developer/setup guide. The product UI itself is 100 % Arabic
+> RTL (`dir="rtl"`, timezone `Asia/Riyadh`, currency `SAR`).
 
 ---
 
@@ -17,167 +17,203 @@
 | Framework | **Next.js 16.4** (App Router, Cache Components, Partial Prerendering) + **React 19.3** |
 | Language | TypeScript (strict) |
 | Styling | **Tailwind CSS v4** + a hand-built shadcn-style UI kit in `src/components/ui/` |
-| ORM | **Drizzle ORM** (`PostgreSQL` dialect) — schema in `src/db/schema.ts` |
-| Database | **PostgreSQL**. Locally: embedded **PGlite** in `.data/` when `DATABASE_URL` is empty. In production: any Postgres (e.g. Supabase) via `DATABASE_URL` |
-| Auth | First-party credentials auth: bcryptjs password hashes + DB-backed sessions in an `httpOnly` cookie (SHA-256 token hashes in the DB) |
+| Database | **PostgreSQL — the Supabase project itself** (schema in `supabase/migrations/`) |
+| Auth | **Supabase Auth** (email + password) via `@supabase/ssr` cookie sessions |
+| Data access | **`@supabase/supabase-js`** (PostgREST) with column aliasing; **no ORM at runtime** |
+| Security | **Row Level Security on every table** (deny-by-default) + `SECURITY DEFINER` RPCs |
 | Validation | Zod v4 (`src/lib/validation.ts`), Arabic error messages |
-| Tests | Vitest (`tests/*.test.ts`) |
+| Tests | Vitest (`tests/*.test.ts`) — 46 tests |
 
-**Why not Supabase Auth / a hosted BaaS?** No Supabase credentials were available in this
-environment, so the app ships with a complete, secure first-party auth + Postgres layer that
-runs with **zero external services** (PGlite). The SQL schema and Drizzle migrations are
-standard PostgreSQL — pointing `DATABASE_URL` at a Supabase (or any) Postgres database is a
-drop-in change, no code edits required.
+**Design rule:** the browser and the server actions only ever hold the
+`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. The service-role key is never used by
+the app — every privileged operation happens inside `SECURITY DEFINER`
+PostgreSQL functions, and every table read/write is gated by RLS.
 
 ---
 
-## 2. Quick start (local, zero services)
+## 2. Features
+
+**Customer portal** — registration (server-generated customer number
+`WA-100001`), dashboard statistics, shipment list/detail with event timeline,
+warehouse packages, consolidation groups, address book (one default, deletion
+locks on active shipments), shipment linking via claims (staff approval),
+payments overview, support tickets, notifications, public **tracking page**
+(`WAS-2026-000001`, no login required).
+
+**Admin console** — dashboard stats (real counts only), customer management
+(suspend/reinstate), shipment status changes through an **admin-configurable
+transition matrix**, warehouse package register/receive (`PKG-000001`),
+claim review (`approve_claim` / `reject_claim` RPCs), support replies
+(`TKT-000001`), offline payment recording (`record_payment` RPC recomputes
+paid/partially_paid/unpaid), status catalogue flags, and an immutable audit log.
+
+**Roles** — `super_admin`, `operations_manager`, `warehouse_staff`,
+`customer_support`, `finance_staff` (+ implicit `customer`), matrix in
+`src/lib/permissions.ts`.
+
+---
+
+## 3. Repository layout
+
+```
+supabase/migrations/     0001_schema · 0002_functions · 0003_rls · 0004_seed
+RESET_AND_SETUP.sql      Full DB setup (paste into Supabase SQL Editor)
+PATCH_0005_align_app.sql App-alignment patch (columns + RPCs; see §4.2)
+src/lib/supabase/        supabase-js browser / SSR clients + env checks
+src/server/queries/      read paths (supabase-js, aliased selects)
+src/server/actions/      Server Actions (Zod → RPCs / RLS-guarded writes)
+src/server/auth/         session + route/action guards
+middleware.ts            cookie refresh + auth redirects (edge)
+tests/                   unit tests (format, permissions, rate-limit, validation)
+```
+
+---
+
+## 4. Setup
+
+### 4.1 Create the Supabase project
+
+1. Create a project at <https://supabase.com/dashboard>.
+2. Open **SQL Editor** → paste the entire **`RESET_AND_SETUP.sql`** → **Run**.
+   (18 tables, 17 functions, triggers, RLS policies, status catalogue + site
+   settings seed.)
+3. **Authentication → Sign In / Providers → Email**: turn **Confirm email**
+   OFF while testing (otherwise new accounts can't sign in immediately).
+
+### 4.2 Apply the app-alignment patch (required)
+
+In the same SQL Editor, paste the entire **`PATCH_0005_align_app.sql`** →
+**Run**. It is idempotent and adds:
+
+- the columns the UI reads/writes (`customer_addresses.label`,
+  `shipment_events.source`, ticket `reply`/`replied_at`, payment
+  `notes`, audit `actor_label`, …) and widens two status checks;
+- the `SECURITY DEFINER` RPCs the app calls:
+  `check_signup_conflicts`, `lookup_login_email`, `log_audit`,
+  `create_notification`, `track_shipment_public` (public tracking), the
+  notes-aware `record_payment`, and an enriched `handle_new_user` trigger
+  that also provisions the first default address;
+- grants that let signed-in users generate tracking/package/ticket numbers,
+  and let anonymous visitors read `site_settings` (public homepage content).
+
+✅ Success signal: a results table of 10 rows (column counts per table) with no
+errors.
+
+### 4.3 Environment
+
+```bash
+cp .env.example .env
+```
+
+Fill in (Dashboard → Project Settings):
+
+| Variable | Value |
+| --- | --- |
+| `NEXT_PUBLIC_SUPABASE_URL` | Project URL, e.g. `https://abcdefgh.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | **Publishable** (anon) API key |
+| `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` (prod: your deployed URL) |
+
+Never add the service-role key to this app.
+
+### 4.4 Run
 
 ```bash
 npm install
-cp .env.example .env      # then edit SESSION_SECRET (see below)
-npm run dev               # predev runs db:migrate + db:seed automatically
+npm run dev        # http://localhost:3000
 ```
 
-Open http://localhost:3000.
-
-`npm run dev` / `npm run build` automatically:
-
-1. `db:migrate` — applies the SQL migrations from `supabase/migrations/` (or `.sql` files) to the database.
-2. `db:seed` — idempotently inserts **reference data only**: the 19 shipment status catalog rows,
-   status transitions, numbering sequences, site settings, and the first super admin.
-
-No fake customers or shipments are ever seeded.
-
-### Required `.env` before any real use
+Quality gates:
 
 ```bash
-SESSION_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
-BOOTSTRAP_ADMIN_EMAIL="admin@your-domain.com"
-BOOTSTRAP_ADMIN_PASSWORD="<strong temporary password>"
+npm test           # vitest (46 tests)
+npm run typecheck  # tsc --noEmit
+npm run lint       # eslint
+npm run build      # production build
 ```
 
----
+### 4.5 Bootstrap the first administrator
 
-## 3. Environment variables
+Staff roles are rows in `user_roles` — there is no self-service way to become
+staff (customers cannot insert into `user_roles`; RLS blocks it):
 
-All variables are documented inline in [`.env.example`](.env.example).
+1. Supabase Dashboard → **Authentication → Users → Add user** →
+   email + password (confirm email off).
+2. SQL Editor → run (replace `<AUTH_USER_UUID>` with that user's UUID):
 
-| Variable | Purpose | Required? |
-| --- | --- | --- |
-| `DATABASE_URL` | Postgres connection string. **Empty ⇒ embedded PGlite in `PGLITE_DATA_DIR`** (local dev) | Prod: yes |
-| `PGLITE_DATA_DIR` | Local embedded DB directory (default `.data`, git-ignored) | No |
-| `SESSION_SECRET` | HMAC/entropy source for session tokens — must be long & random | **Yes** |
-| `SESSION_COOKIE_NAME` / `SESSION_TTL_DAYS` | Session cookie name / lifetime (default 30 days) | No |
-| `NEXT_PUBLIC_APP_URL` | Canonical origin, used in emails/links | Prod: yes |
-| `APP_TIMEZONE` | `Asia/Riyadh` | No |
-| `UPLOAD_DIR` / `MAX_UPLOAD_BYTES` | Upload storage root & size cap | No |
-| `PAYMENT_GATEWAY_*` | Gateway name, keys, webhook secret. `PAYMENT_GATEWAY_ENABLED=false` until a Saudi gateway is contracted; the UI then shows **"بانتظار الإعداد"** instead of pretending to charge cards | For payments |
-| `BOOTSTRAP_ADMIN_EMAIL/_PASSWORD/_NAME` | Creates the first super admin on first `db:seed` | First run |
-
-Card numbers and CVV are **never** stored anywhere — the payment layer records gateway
-references, amounts and statuses only.
-
----
-
-## 4. Scripts
-
-```bash
-npm run dev          # start dev server (auto db:setup)
-npm run build        # production build (auto db:setup)
-npm start            # serve the production build
-npm run lint         # eslint
-npm run typecheck    # tsc --noEmit
-npm test             # vitest run (authorization, validation, rate-limit, format suites)
-npm run db:generate  # drizzle-kit generate → new SQL migration
-npm run db:migrate   # apply migrations
-npm run db:seed      # idempotent reference seed + admin bootstrap
-npm run db:setup     # migrate + seed
+```sql
+select public.promote_to_super_admin('<AUTH_USER_UUID>');
 ```
 
-> `npx next typegen` must be re-run after adding any new route file, otherwise `tsc`
-> fails with stale `PageProps` route constraints.
+3. Sign in at `/login` with that account → `/admin`.
 
 ---
 
-## 5. Project structure
+## 5. Deployment
 
-```
-src/
-  app/
-    (marketing)/     # public: /, /track, /privacy
-    (auth)/          # /register, /login, /forgot-password, /reset-password
-    (portal)/        # customer: /dashboard /shipments /addresses /payments
-                     #           /notifications /help /link-shipment /welcome ...
-    admin/           # staff: dashboard, customers, shipments, warehouse,
-                     #        claims, payments, support, statuses, audit
-  components/        # ui kit (button, card, dialog, form, table, badge, ...)
-                     # shipment/, brand/, stat-card
-  db/
-    schema.ts        # 21 tables, enums, constraints, indexes (source of truth)
-    client.ts        # getDb() → PGlite or node-postgres, withTransaction()
-  lib/               # validation.ts, permissions.ts, format.ts, constants.ts, ids
-  server/
-    actions/         # server actions (auth, addresses, claims, tracking, admin, statuses, support)
-    queries/         # read models (portal + admin)
-    auth/            # session, guards (requireCustomer / requireAdmin / requirePermission)
-    audit.ts, notify.ts, rate-limit.ts, ids.ts
-scripts/             # migrate.mjs, seed.mjs (plain ESM)
-tests/               # vitest suites
-supabase/migrations/ # generated SQL migrations
-```
+The fastest path is Vercel's one-click deploy of this repository:
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fbinsunker-glitch%2FShippingGoods&project-name=world-associates-shipping&framework=nextjs&env=NEXT_PUBLIC_SUPABASE_URL%2CNEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY%2CNEXT_PUBLIC_APP_URL&envDescription=Supabase%20Project%20URL%2C%20publishable%20(anon)%20key%2C%20then%20the%20deployed%20URL%20itself&env-NEXT_PUBLIC_SUPABASE_URL=https%3A%2F%2Fgqsydgfftfnecpmwlpqh.supabase.co&env-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_ykbUQmMJNsWtYgtNXuIooQ_P8lsKY0a&env-NEXT_PUBLIC_APP_URL=https%3A%2F%2Fyour-app.vercel.app)
+
+Manual equivalent: **Vercel → Add New → Import Git Repository** → select
+`binsunker-glitch/ShippingGoods` → set the three env vars above → Deploy
+(Next.js is auto-detected).
+
+**After the first deploy:**
+
+1. Set `NEXT_PUBLIC_APP_URL` to the real URL Vercel assigned
+   (`https://<project>.vercel.app`) — it is used in auth/recovery links.
+2. Supabase → **Authentication → URL Configuration** → add
+   `https://<project>.vercel.app/**` to Redirect URLs (needed for password
+   recovery links).
+3. The database is shared with your Supabase project — just make sure §4.1–4.2
+   were applied once; no per-deploy DB work exists anymore.
+
+> **Note:** the deploy button already contains this project's URL and
+> *publishable* key. That key is designed to be public (it ships in the
+> browser bundle of any Supabase app); RLS is what protects the data. The
+> service-role key is never part of the app or the repository.
 
 ---
 
-## 6. Security model
+## 6. Architecture & security notes
 
-- **Authentication**: bcryptjs (cost 10+) password hashes; sessions stored server-side with
-  SHA-256 token hashes; `httpOnly`, `SameSite=Lax`, `Secure` (in production) cookie.
-  Customer IDs (`WA-100001`) are **display identifiers only — never credentials**.
-- **Authorization**: every portal/admin server action and query re-checks the session and role
-  server-side (`requireCustomer`, `requireAdmin`, `requirePermission`). The admin nav is
-  filtered by `permissionsFor(role)`, but the **server is the enforcement point** — a hidden
-  link is never the only control.
-- **Roles**: `super_admin`, `operations_manager`, `warehouse_staff`, `support`, `finance`,
-  `customer`. Unknown/garbage roles are rejected by an explicit staff-role allow-list.
-- **Data isolation**: every customer query filters by `customerId = session.profileId`
-  (IDOR-proof); shipment claims verify ownership and queue uncertain ones for staff approval,
-  with DB partial unique indexes preventing multi-claim.
-- **Rate limiting**: in-memory limiter on register / login / password reset / public tracking.
-- **Audit log**: staff and sensitive customer mutations write `audit_logs` rows (actor, action,
-  entity, timestamp) — viewable at `/admin/audit`.
-- **Passwords**: never logged, never returned by actions; reset tokens are single-use,
-  expiring, stored hashed.
-- **PII**: no passwords/tokens/full addresses in logs; retention aligned with Saudi PDPL-style
-  expectations (documented in `/privacy`, editable from admin).
+- **Identity** — `profiles.id` is `auth.users.id`; a `handle_new_user` trigger
+  provisions the profile (`WA-100001`, server-seeded) and first address on
+  sign-up. Suspended accounts (`profiles.account_status ≠ 'active'`) get
+  `null` from `getSession()` on every request, which kills all live sessions.
+- **Session** — `@supabase/ssr` stores the Supabase session in `httpOnly`
+  cookies; `middleware.ts` refreshes tokens and redirects anonymous visitors.
+- **RLS** — deny-by-default on all 18 tables. Customers read only their own
+  rows; staff writes are role-scoped policies; audit/notifications go through
+  `SECURITY DEFINER` RPCs so ownership checks live in one place
+  (`supabase/migrations/0003_rls.sql`).
+- **Status taxonomy** — the 18 shipment statuses live in
+  `shipment_status_catalog`; the 7 dashboard groups
+  (`warehouse/ready/awaiting_payment/in_transit/delivered/exception/cancelled`)
+  are **derived in TypeScript** from `STATUS_GROUP_BY_CODE`
+  (`src/lib/constants.ts`) so UI tabs and filters can never drift from the DB.
+- **Status changes** — only via `transition_shipment()`, which validates the
+  admin-managed transition matrix and writes one idempotent timeline event
+  atomically. Catalogue flags (`restricted`, `is_active`) are enforced too.
+- **Claim linking** — submitting a claim never assigns a shipment. Every claim
+  is queued `pending`; staff approve through `approve_claim()`, which links the
+  shipment to the claimant inside one transaction.
+- **Payments** — `record_payment()` accepts amount/method/reference/notes only
+  (never card numbers or CVV), recompute the shipment's
+  `paid/partially_paid/unpaid` state from `verified` rows, and write the audit
+  entry themselves.
+- **Public tracking** — anonymous lookups go through
+  `track_shipment_public()`, which returns only safe fields (status, dates,
+  timeline) — never customer names, phones, addresses, or fees.
+- **Rate limiting** — in-process fixed windows on login, registration,
+  password recovery, claims, tickets, and tracking (see `src/server/rate-limit.ts`).
+  For multi-instance deployments back this with a shared store.
+- **Audit** — every sensitive action appends to `audit_logs` via `log_audit()`;
+  the actor is always `auth.uid()` (never client-supplied), and sensitive keys
+  are redacted.
 
 ---
 
-## 7. Deployment
+## 7. License / contact
 
-1. Provision a PostgreSQL database (Supabase, Neon, RDS, …) and set `DATABASE_URL`.
-2. Set `SESSION_SECRET`, `NEXT_PUBLIC_APP_URL`, `BOOTSTRAP_ADMIN_*`, and upload/payment vars.
-3. `npm run build` → `npm start` (or deploy to Vercel/Node host). `prebuild` runs `db:setup`.
-4. Log in with the bootstrap admin, change the password immediately, then create staff
-   accounts and assign roles.
-5. Point the payment gateway variables at a contracted Saudi gateway before enabling
-   checkout; until then payments stay in the documented "pending configuration" state.
-
-The embedded PGlite database (`/data`, `.data/`) is **not** suitable for multi-instance or
-serverless production — use a real Postgres there.
-
----
-
-## 8. Known limitations / what still needs wiring
-
-- **Payment gateway**: architecture is in place (gateway abstraction, verified-webhook
-  endpoint, finance offline-payment recording with audit), but no live gateway credentials
-  were available, so live card checkout is intentionally disabled and labeled as such.
-- **Email/SMS delivery**: password-reset and notification *delivery* goes through the DB
-  notification center; wiring an actual SMTP/SMS provider (e.g. Unifonic) is a config-only
-  task in `src/server/notify.ts`.
-- **File uploads**: upload constraints and storage path exist, but virus-scanning and an
-  object-storage (S3) backend should be added for production documents.
-- **Rate limiting** is in-memory per instance; use Redis for multi-instance deployments.
-- **Content**: FAQ/privacy/contact/site settings are editable rows in `site_settings`
-  (seeded with sensible Arabic defaults and an explicit "review with legal counsel" note).
+World Associates Shipping CO — Guangzhou, China → المملكة العربية السعودية.

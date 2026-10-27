@@ -1,17 +1,7 @@
 "use server";
 
-import { randomUUID, createHash } from "node:crypto";
-
-import { and, eq, isNull, sql, or } from "drizzle-orm";
 import { redirect } from "next/navigation";
 
-import { getDb, withTransaction } from "@/db/client";
-import {
-  authCredentials,
-  customerAddresses,
-  passwordResets,
-  profiles,
-} from "@/db/schema";
 import type { ActionState } from "@/lib/action-state";
 import {
   fieldErrors,
@@ -20,25 +10,11 @@ import {
   passwordSchema,
   registerSchema,
 } from "@/lib/validation";
-import { logAudit } from "@/server/audit";
-import { hashPassword, verifyPassword } from "@/server/auth/password";
-import {
-  createSession,
-  destroySession,
-  getIpAddress,
-  getUserAgent,
-  revokeSessions,
-} from "@/server/auth/session";
-import { isUniqueViolation, nextCustomerNumber } from "@/server/ids";
-import { createNotification } from "@/server/notify";
+import { createClient } from "@/lib/supabase/server";
+import { getIpAddress } from "@/server/auth/session";
 import { enforceRateLimit, rateLimit } from "@/server/rate-limit";
 
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCK_MINUTES = 15;
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
 
 function genericLoginError(): ActionState {
   return {
@@ -48,9 +24,19 @@ function genericLoginError(): ActionState {
 }
 
 /* ------------------------------------------------------------------ */
-/* Registration                                                        */
+/* Registration (Supabase Auth)                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Registers a new customer through Supabase Auth.
+ *
+ * The email/password pair is the authentication credential and lives in
+ * `auth.users`. The customer profile (permanent `WA-…` number) and the initial
+ * default address are provisioned **atomically on the database** by the
+ * `on_auth_user_created` trigger (see `supabase/migrations/0002_functions.sql`),
+ * so a public caller can never choose a customer number, account status, role,
+ * or shipment ownership.
+ */
 export async function registerAction(
   _prev: ActionState,
   formData: FormData,
@@ -83,7 +69,6 @@ export async function registerAction(
   };
 
   const echo: Record<string, string> = { ...raw, password: "", confirmPassword: "" };
-
   const parsed = registerSchema.safeParse(raw);
 
   if (!parsed.success) {
@@ -96,14 +81,18 @@ export async function registerAction(
   }
 
   const data = parsed.data;
-  const db = await getDb();
+  const supabase = await createClient();
 
-  const phoneTaken = await db
-    .select({ id: profiles.id })
-    .from(profiles)
-    .where(eq(profiles.phone, data.phone))
-    .limit(1);
-  if (phoneTaken.length > 0) {
+  // Friendly duplicate check before touching Supabase Auth. Uses a
+  // SECURITY DEFINER function so an anonymous visitor can check a field they
+  // are about to register, without being able to read any table.
+  const { data: conflicts } = await supabase.rpc("check_signup_conflicts", {
+    p_phone: data.phone,
+    p_email: data.email,
+  });
+
+  const conflict = (conflicts ?? {}) as { phone_taken?: boolean; email_taken?: boolean };
+  if (conflict.phone_taken) {
     return {
       ok: false,
       message: "رقم الجوال مرتبط بحساب موجود بالفعل.",
@@ -111,104 +100,49 @@ export async function registerAction(
       data: echo,
     };
   }
-
-  if (data.email) {
-    const emailTaken = await db
-      .select({ id: profiles.id })
-      .from(profiles)
-      .where(eq(profiles.email, data.email))
-      .limit(1);
-    if (emailTaken.length > 0) {
-      return {
-        ok: false,
-        message: "البريد الإلكتروني مرتبط بحساب موجود بالفعل.",
-        errors: { email: "البريد الإلكتروني مسجل بحساب آخر" },
-        data: echo,
-      };
-    }
+  if (conflict.email_taken) {
+    return {
+      ok: false,
+      message: "البريد الإلكتروني مرتبط بحساب موجود بالفعل.",
+      errors: { email: "البريد الإلكتروني مسجل بسابقة" },
+      data: echo,
+    };
   }
 
-  const passwordHash = await hashPassword(data.password);
-  let profileId: string;
-  let customerNumber: string;
-
-  try {
-    const created = await withTransaction(async (tx) => {
-      const number = await nextCustomerNumber(tx);
-      const id = randomUUID();
-
-      await tx.insert(profiles).values({
-        id,
-        customerNumber: number,
-        fullName: data.fullName,
+  const { data: signUpData, error } = await supabase.auth.signUp({
+    email: data.email,
+    password: data.password,
+    options: {
+      // Consumed by the `on_auth_user_created` trigger to provision the
+      // profile and the default address server-side.
+      data: {
+        full_name: data.fullName,
         phone: data.phone,
         email: data.email,
         city: data.city,
-        role: "customer",
-        accountStatus: "active",
-      });
-
-      await tx.insert(authCredentials).values({
-        id: randomUUID(),
-        profileId: id,
-        passwordHash,
-      });
-
-      // The registration address becomes the default delivery address.
-      await tx.insert(customerAddresses).values({
-        id: randomUUID(),
-        customerId: id,
-        label: "عنوان التسجيل",
-        recipientName: data.fullName,
-        phone: data.phone,
-        city: data.city,
         district: data.district,
         street: data.street,
-        buildingNumber: data.buildingNumber,
-        secondaryNumber: data.secondaryNumber || null,
-        postalCode: data.postalCode,
-        nationalAddressShortCode: data.nationalAddressShortCode || null,
-        addressDetails: data.addressDetails || null,
-        isDefault: true,
-      });
+        building_number: data.buildingNumber,
+        secondary_number: data.secondaryNumber,
+        postal_code: data.postalCode,
+        national_address_short_code: data.nationalAddressShortCode,
+        address_details: data.addressDetails,
+      },
+      emailRedirectTo: `${APP_URL}/login`,
+    },
+  });
 
-      await logAudit(
-        {
-          actorId: id,
-          actorLabel: data.fullName,
-          action: "customer.registered",
-          entityType: "profile",
-          entityId: id,
-          metadata: { customerNumber: number },
-        },
-        tx,
-      );
-
-      await createNotification(
-        {
-          customerId: id,
-          title: "مرحباً بك في World Associates Shipping CO",
-          message: "تم إنشاء حسابك بنجاح. احتفظ برقم العميل الخاص بك واستخدمه عند الشراء من الصين.",
-          type: "success",
-          link: "/welcome",
-        },
-        tx,
-      );
-
-      return { id, number };
-    });
-
-    profileId = created.id;
-    customerNumber = created.number;
-  } catch (error) {
-    if (isUniqueViolation(error)) {
+  if (error) {
+    const msg = error.message?.toLowerCase() ?? "";
+    if (msg.includes("already registered") || msg.includes("already exists")) {
       return {
         ok: false,
-        message: "يوجد حساب مسجّل بهذه البيانات بالفعل.",
+        message: "البريد الإلكتروني مرتبط بحساب موجود بالفعل.",
+        errors: { email: "البريد الإلكتروني مسجل بسابقة" },
         data: echo,
       };
     }
-    console.error("[auth] registration failed", error);
+    console.error("[auth] signup failed", error.message);
     return {
       ok: false,
       message: "تعذّر إنشاء الحساب حالياً. حاول مرة أخرى لاحقاً.",
@@ -216,14 +150,49 @@ export async function registerAction(
     };
   }
 
-  await createSession(profileId, await getUserAgent());
+  // Email confirmation enabled: no session yet. Tell the user to verify.
+  if (!signUpData.session) {
+    return {
+      ok: true,
+      message:
+        "تم إنشاء الحساب. تحقّق من بريدك الإلكتروني لتفعيل الحساب ثم سجّل الدخول.",
+    };
+  }
+
+  // Session established (confirmations disabled): fetch the server-generated
+  // customer number and continue to the welcome screen.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const customerNumber = user
+    ? await fetchCustomerNumber(supabase, user.id)
+    : "";
+
   redirect(`/welcome?n=${encodeURIComponent(customerNumber)}`);
+}
+
+async function fetchCustomerNumber(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  userId: string,
+): Promise<string> {
+  const { data } = await supabase
+    .from("profiles")
+    .select("customer_number")
+    .eq("id", userId)
+    .maybeSingle();
+  return data?.customer_number ?? "";
 }
 
 /* ------------------------------------------------------------------ */
 /* Login                                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Signs in with Supabase Auth. Login is by **email + password** (Supabase Auth
+ * email/password). For convenience the customer number / phone identifier is
+ * resolved to the account email through a SECURITY DEFINER lookup so the
+ * existing multi-identifier login form keeps working.
+ */
 export async function loginAction(
   _prev: ActionState,
   formData: FormData,
@@ -236,10 +205,7 @@ export async function loginAction(
     enforceRateLimit(`login:${ip}`, 10, 5 * 60 * 1000);
     if (identifierRaw) enforceRateLimit(`login-id:${identifierRaw.toLowerCase()}`, 10, 5 * 60 * 1000);
   } catch {
-    return {
-      ok: false,
-      message: "محاولات دخول كثيرة. انتظر دقائق ثم أعد المحاولة.",
-    };
+    return { ok: false, message: "محاولات دخول كثيرة. انتظر دقائق ثم أعد المحاولة." };
   }
 
   const parsed = loginSchema.safeParse({ identifier: identifierRaw, password });
@@ -248,110 +214,43 @@ export async function loginAction(
   }
 
   const identifier = parsed.data.identifier;
-  const phone = normalizeSaudiPhone(identifier);
-  const customerNumber = /^WA-[A-Za-z0-9-]+$/.test(identifier.toUpperCase())
-    ? identifier.toUpperCase()
-    : null;
-  const email = identifier.includes("@") ? identifier.toLowerCase() : null;
+  const supabase = await createClient();
 
-  const db = await getDb();
-  const rows = await db
-    .select({
-      id: profiles.id,
-      phone: profiles.phone,
-      email: profiles.email,
-      customerNumber: profiles.customerNumber,
-      fullName: profiles.fullName,
-      role: profiles.role,
-      accountStatus: profiles.accountStatus,
-      credentialId: authCredentials.id,
-      passwordHash: authCredentials.passwordHash,
-      failedAttempts: authCredentials.failedAttempts,
-      lockedUntil: authCredentials.lockedUntil,
-    })
-    .from(profiles)
-    .leftJoin(authCredentials, eq(authCredentials.profileId, profiles.id))
-    .where(
-      or(
-        phone ? eq(profiles.phone, phone) : sql`false`,
-        email ? eq(profiles.email, email) : sql`false`,
-        customerNumber ? eq(profiles.customerNumber, customerNumber) : sql`false`,
-      ),
-    )
-    .limit(1);
+  // Resolve a phone / customer-number identifier to the account email.
+  let email = identifier.includes("@") ? identifier.toLowerCase() : null;
+  if (!email) {
+    const { data: resolved } = await supabase.rpc("lookup_login_email", {
+      p_identifier: normalizeSaudiPhone(identifier) ?? identifier,
+    });
+    email = resolved ?? null;
+  }
+  if (!email) return genericLoginError();
 
-  const user = rows[0];
-  const now = new Date();
-
-  // Always compare a password so a missing account is not detectable by timing.
-  if (!user || !user.passwordHash || !user.credentialId) {
-    await verifyPassword(
-      password || "invalid",
-      "$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalid",
-    );
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error || !data.user) {
     return genericLoginError();
   }
 
-  if (user.lockedUntil && new Date(user.lockedUntil).getTime() > now.getTime()) {
-    const minutes = Math.max(1, Math.ceil((new Date(user.lockedUntil).getTime() - now.getTime()) / 60000));
-    return {
-      ok: false,
-      message: `تم قفل الدخول مؤقتاً بعد محاولات فاشلة. حاول بعد ${minutes} دقيقة.`,
-    };
+  // Enforce account status (Supabase Auth would still mint a session).
+  const userId = data.user.id;
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("account_status")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (profile && profile.account_status !== "active") {
+    await supabase.auth.signOut();
+    return { ok: false, message: "هذا الحساب موقوف. تواصل مع الدعم للمساعدة." };
   }
 
-  const valid = await verifyPassword(password, user.passwordHash);
-  if (!valid) {
-    const attempts = (user.failedAttempts ?? 0) + 1;
-    const lock = attempts >= MAX_FAILED_ATTEMPTS;
-    await db
-      .update(authCredentials)
-      .set({
-        failedAttempts: attempts,
-        lockedUntil: lock ? new Date(now.getTime() + LOCK_MINUTES * 60000) : user.lockedUntil,
-      })
-      .where(eq(authCredentials.id, user.credentialId));
-    await logAudit({
-      actorId: user.id,
-      actorLabel: user.fullName,
-      action: lock ? "auth.login_locked" : "auth.login_failed",
-      entityType: "profile",
-      entityId: user.id,
-      metadata: { attempts },
-    });
-    return genericLoginError();
-  }
+  const { data: roles } = await supabase
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", userId);
+  const role = roles?.[0]?.role ?? "customer";
 
-  if (user.accountStatus !== "active") {
-    await logAudit({
-      actorId: user.id,
-      actorLabel: user.fullName,
-      action: "auth.login_denied_suspended",
-      entityType: "profile",
-      entityId: user.id,
-    });
-    return {
-      ok: false,
-      message: "هذا الحساب موقوف. تواصل مع الدعم للمساعدة.",
-    };
-  }
-
-  await db
-    .update(authCredentials)
-    .set({ failedAttempts: 0, lockedUntil: null })
-    .where(eq(authCredentials.id, user.credentialId));
-
-  await createSession(user.id, await getUserAgent());
-
-  await logAudit({
-    actorId: user.id,
-    actorLabel: user.fullName,
-    action: "auth.login",
-    entityType: "profile",
-    entityId: user.id,
-  });
-
-  redirect(user.role === "customer" ? "/dashboard" : "/admin");
+  redirect(role === "customer" ? "/dashboard" : "/admin");
 }
 
 /* ------------------------------------------------------------------ */
@@ -361,15 +260,14 @@ export async function loginAction(
 export async function logoutAction(): Promise<void> {
   const ip = await getIpAddress().catch(() => "unknown");
   rateLimit(`logout:${ip}`, 30, 60_000);
-  await destroySession();
+  const supabase = await createClient();
+  await supabase.auth.signOut();
   redirect("/");
 }
 
 /* ------------------------------------------------------------------ */
-/* Password reset                                                      */
+/* Password reset (Supabase Auth)                                      */
 /* ------------------------------------------------------------------ */
-
-const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export async function requestPasswordResetAction(
   _prev: ActionState,
@@ -387,62 +285,37 @@ export async function requestPasswordResetAction(
     return { ok: false, message: "أدخل البريد الإلكتروني أو رقم الجوال." };
   }
 
-  const phone = normalizeSaudiPhone(identifier);
-  const email = identifier.includes("@") ? identifier.toLowerCase() : null;
-  const customerNumber = /^WA-[A-Za-z0-9-]+$/i.test(identifier)
-    ? identifier.toUpperCase()
-    : null;
-
-  const db = await getDb();
-  const rows = await db
-    .select({ id: profiles.id, fullName: profiles.fullName })
-    .from(profiles)
-    .where(
-      or(
-        phone ? eq(profiles.phone, phone) : sql`false`,
-        email ? eq(profiles.email, email) : sql`false`,
-        customerNumber ? eq(profiles.customerNumber, customerNumber) : sql`false`,
-      ),
-    )
-    .limit(1);
-
-  const genericResponse: ActionState = {
-    ok: true,
-    message:
-      "إذا كان الحساب مسجلاً بهذه البيانات فسيتم إنشاء رابط إعادة تعيين صالح لمدة ساعة.",
-  };
-
-  const user = rows[0];
-  if (!user) return genericResponse;
-
-  const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
-  await db.insert(passwordResets).values({
-    id: randomUUID(),
-    profileId: user.id,
-    tokenHash: sha256(token),
-    expiresAt: new Date(Date.now() + RESET_TTL_MS),
-  });
-  await logAudit({
-    actorId: user.id,
-    actorLabel: user.fullName,
-    action: "auth.password_reset_requested",
-    entityType: "profile",
-    entityId: user.id,
-  });
-  await revokeSessions(user.id);
-
-  // No mail provider is bundled. In development the link is returned so the
-  // flow can be completed; in production it is only stored (see README:
-  // "Configuring the e-mail provider").
-  if (process.env.NODE_ENV !== "production") {
+  const supabase = await createClient();
+  let email = identifier.includes("@") ? identifier.toLowerCase() : null;
+  if (!email) {
+    const { data: resolved } = await supabase.rpc("lookup_login_email", {
+      p_identifier: normalizeSaudiPhone(identifier) ?? identifier,
+    });
+    email = resolved ?? null;
+  }
+  if (!email) {
+    // Do not reveal whether the account exists.
     return {
-      ...genericResponse,
-      data: { resetUrl: `/reset-password?token=${token}` },
+      ok: true,
+      message: "إذا كان الحساب مسجلاً بهذه البيانات فسيتم إرسال رابط إعادة التعيين.",
     };
   }
-  return genericResponse;
+
+  await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: `${APP_URL}/reset-password`,
+  });
+
+  return {
+    ok: true,
+    message: "إذا كان الحساب مسجلاً بهذه البيانات فسيتم إرسال رابط إعادة التعيين.",
+  };
 }
 
+/**
+ * Completes a password reset. The recovery link establishes a Supabase session
+ * (handled by `middleware.ts` + `@supabase/ssr`), and this action updates the
+ * password for that session.
+ */
 export async function resetPasswordAction(
   _prev: ActionState,
   formData: FormData,
@@ -454,59 +327,36 @@ export async function resetPasswordAction(
     return { ok: false, message: "تم تجاوز عدد المحولات. حاول لاحقاً." };
   }
 
-  const token = String(formData.get("token") ?? "").trim();
   const password = String(formData.get("password") ?? "");
   const confirmPassword = String(formData.get("confirmPassword") ?? "");
 
-  if (!token) return { ok: false, message: "رابط إعادة التعيين غير صالح." };
   if (password !== confirmPassword) {
     return { ok: false, errors: { confirmPassword: "كلمتا المرور غير متطابقتين" } };
   }
-
   const parsed = passwordSchema.safeParse(password);
   if (!parsed.success) {
-    return { ok: false, errors: { password: parsed.error.issues[0]?.message ?? "كلمة المرور غير صالحة" } };
+    return {
+      ok: false,
+      errors: { password: parsed.error.issues[0]?.message ?? "كلمة المرور غير صالحة" },
+    };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select({ id: passwordResets.id, profileId: passwordResets.profileId, expiresAt: passwordResets.expiresAt, usedAt: passwordResets.usedAt })
-    .from(passwordResets)
-    .where(eq(passwordResets.tokenHash, sha256(token)))
-    .limit(1);
-
-  const row = rows[0];
-  if (!row || row.usedAt || new Date(row.expiresAt).getTime() < Date.now()) {
-    return { ok: false, message: "رابط إعادة التعيين غير صالح أو منتهي الصلاحية." };
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return {
+      ok: false,
+      message: "رابط إعادة التعيين غير صالح أو منتهي الصلاحية. اطلب رابطاً جديداً.",
+    };
   }
 
-  const passwordHash = await hashPassword(password);
-
-  try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(passwordResets)
-        .set({ usedAt: new Date() })
-        .where(and(eq(passwordResets.id, row.id), isNull(passwordResets.usedAt)));
-      await tx
-        .update(authCredentials)
-        .set({ passwordHash, passwordUpdatedAt: new Date(), failedAttempts: 0, lockedUntil: null, mustChangePassword: false })
-        .where(eq(authCredentials.profileId, row.profileId));
-      await logAudit(
-        {
-          actorId: row.profileId,
-          action: "auth.password_reset_completed",
-          entityType: "profile",
-          entityId: row.profileId,
-        },
-        tx,
-      );
-    });
-  } catch {
+  const { error } = await supabase.auth.updateUser({ password });
+  if (error) {
     return { ok: false, message: "تعذّر تحديث كلمة المرور. أعد المحاولة." };
   }
 
-  await revokeSessions(row.profileId);
   redirect("/login?reset=1");
 }
 
@@ -525,10 +375,6 @@ export async function changePasswordAction(
     return { ok: false, message: "تم تجاوز عدد المحولات. حاول لاحقاً." };
   }
 
-  const { getSession } = await import("@/server/auth/guards");
-  const session = await getSession();
-  if (!session) return { ok: false, message: "انتهت الجلسة. سجّل الدخول مجدداً." };
-
   const currentPassword = String(formData.get("currentPassword") ?? "");
   const password = String(formData.get("password") ?? "");
   const confirmPassword = String(formData.get("confirmPassword") ?? "");
@@ -536,44 +382,34 @@ export async function changePasswordAction(
   if (password !== confirmPassword) {
     return { ok: false, errors: { confirmPassword: "كلمتا المرور غير متطابقتين" } };
   }
-
   const parsed = passwordSchema.safeParse(password);
   if (!parsed.success) {
-    return { ok: false, errors: { password: parsed.error.issues[0]?.message ?? "كلمة المرور غير صالحة" } };
+    return {
+      ok: false,
+      errors: { password: parsed.error.issues[0]?.message ?? "كلمة المرور غير صالحة" },
+    };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select({ id: authCredentials.id, passwordHash: authCredentials.passwordHash })
-    .from(authCredentials)
-    .where(eq(authCredentials.profileId, session.profileId))
-    .limit(1);
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user?.email) return { ok: false, message: "انتهت الجلسة. سجّل الدخول مجدداً." };
 
-  const credential = rows[0];
-  if (!credential || !(await verifyPassword(currentPassword, credential.passwordHash))) {
+  // Verify the current password by re-authenticating (Supabase Auth has no
+  // direct "verify current password" API).
+  const { error: reauthError } = await supabase.auth.signInWithPassword({
+    email: user.email,
+    password: currentPassword,
+  });
+  if (reauthError) {
     return { ok: false, errors: { currentPassword: "كلمة المرور الحالية غير صحيحة" } };
   }
 
-  const passwordHash = await hashPassword(password);
-  await db
-    .update(authCredentials)
-    .set({ passwordHash, passwordUpdatedAt: new Date(), mustChangePassword: false })
-    .where(eq(authCredentials.id, credential.id));
-
-  await logAudit({
-    actorId: session.profileId,
-    actorLabel: session.fullName,
-    action: "auth.password_changed",
-    entityType: "profile",
-    entityId: session.profileId,
-  });
-
-  // Drop every other session, keep the one that performed the change.
-  const { sessions } = await import("@/db/schema");
-  await db
-    .update(sessions)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(sessions.profileId, session.profileId), sql`${sessions.id} <> ${session.sessionId}`));
+  const { error } = await supabase.auth.updateUser({ password });
+  if (error) {
+    return { ok: false, message: "تعذّر تحديث كلمة المرور. أعد المحاولة." };
+  }
 
   return { ok: true, message: "تم تغيير كلمة المرور بنجاح." };
 }

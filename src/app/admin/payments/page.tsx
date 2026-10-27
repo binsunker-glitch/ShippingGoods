@@ -31,7 +31,7 @@ const RECORD_STATUS_VARIANTS: Record<string, BadgeVariant> = {
 
 const TABS = [
   { label: "الكل", value: "all" },
-  { label: "مكتملة", value: "completed" },
+  { label: "مكتملة", value: "verified" },
   { label: "بانتظار التحقق", value: "pending" },
   { label: "فشلت", value: "failed" },
   { label: "مستردة", value: "refunded" },

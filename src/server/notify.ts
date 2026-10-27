@@ -1,10 +1,6 @@
 import "server-only";
 
-import { randomUUID } from "node:crypto";
-
-import { getDb } from "@/db/client";
-import type { Tx } from "@/db/client";
-import { notifications } from "@/db/schema";
+import { createClient } from "@/lib/supabase/server";
 
 export type NotificationInput = {
   customerId: string;
@@ -14,20 +10,23 @@ export type NotificationInput = {
   link?: string | null;
 };
 
-/** Stores a customer notification (rendered in the portal bell + /notifications). */
-export async function createNotification(
-  input: NotificationInput,
-  tx?: Tx,
-): Promise<string> {
-  const executor = tx ?? (await getDb());
-  const id = randomUUID();
-  await executor.insert(notifications).values({
-    id,
-    customerId: input.customerId,
-    title: input.title,
-    message: input.message,
-    notificationType: input.type ?? "info",
-    link: input.link ?? null,
+/**
+ * Stores a customer notification via the `create_notification` SECURITY DEFINER
+ * function. The database only allows a caller to notify themselves, or — for
+ * staff-initiated updates — any customer. Customers can never notify others.
+ */
+export async function createNotification(input: NotificationInput): Promise<string> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("create_notification", {
+    p_customer_id: input.customerId,
+    p_title: input.title,
+    p_message: input.message,
+    p_type: input.type ?? "info",
+    p_link: input.link ?? null,
   });
-  return id;
+  if (error) {
+    console.error("[notify] failed to create notification", error.message);
+    return "";
+  }
+  return (data as string) ?? "";
 }

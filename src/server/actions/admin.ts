@@ -1,25 +1,14 @@
 "use server";
 
-import { randomUUID } from "node:crypto";
-
-import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { z } from "zod";
 
-import { getDb, withTransaction } from "@/db/client";
-import {
-  packages,
-  profiles,
-  shipmentClaimRequests,
-  shipmentEvents,
-  shipmentPayments,
-  shipments,
-  supportTickets,
-} from "@/db/schema";
 import type { ActionState } from "@/lib/action-state";
 import { fieldErrors } from "@/lib/validation";
-import { z } from "zod";
+import { createClient } from "@/lib/supabase/server";
 import { logAudit } from "@/server/audit";
 import { requirePermissionAction } from "@/server/auth/guards";
+import { nextPackageReference } from "@/server/ids";
 import { createNotification } from "@/server/notify";
 import { canTransition, getStatusCatalog } from "@/server/queries/statuses";
 
@@ -50,15 +39,21 @@ export async function setCustomerStatusAction(
     return { ok: false, message: "إجراء غير معروف." };
   }
 
-  const db = await getDb();
-  const target = await db
-    .select({ id: profiles.id, fullName: profiles.fullName, role: profiles.role, accountStatus: profiles.accountStatus })
-    .from(profiles)
-    .where(eq(profiles.id, raw.profileId))
-    .limit(1);
-  const customer = target[0];
+  const supabase = await createClient();
+
+  const { data: customer } = await supabase
+    .from("profiles")
+    .select("id, full_name, account_status")
+    .eq("id", raw.profileId)
+    .maybeSingle();
   if (!customer) return { ok: false, message: "العميل غير موجود." };
-  if (customer.role !== "customer") {
+
+  // Staff accounts are managed elsewhere — never suspended from this screen.
+  const { data: roleRows } = await supabase
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", customer.id);
+  if ((roleRows ?? []).length > 0) {
     return { ok: false, message: "لا يمكن إيقاف حساب موظف من هذه الشاشة." };
   }
   if (customer.id === session.profileId) {
@@ -74,45 +69,33 @@ export async function setCustomerStatusAction(
 
   const nextStatus = raw.action === "suspend" ? "suspended" : "active";
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(profiles)
-        .set({ accountStatus: nextStatus, updatedAt: new Date() })
-        .where(eq(profiles.id, customer.id));
+    const { error } = await supabase
+      .from("profiles")
+      .update({ account_status: nextStatus })
+      .eq("id", customer.id);
+    if (error) throw new Error(error.message);
 
-      // Suspending drops every active session immediately.
-      if (nextStatus === "suspended") {
-        const { sessions } = await import("@/db/schema");
-        await tx
-          .update(sessions)
-          .set({ revokedAt: new Date() })
-          .where(and(eq(sessions.profileId, customer.id)));
-      }
+    // Suspension is enforced on every request: getSession() returns null for
+    // any account whose status is not "active", so live sessions stop working
+    // immediately without a server-side session table.
 
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: raw.action === "suspend" ? "customer.suspended" : "customer.activated",
-          entityType: "profile",
-          entityId: customer.id,
-          metadata: { reason: raw.reason || undefined, previous: customer.accountStatus },
-        },
-        tx,
-      );
-
-      if (nextStatus === "active") {
-        await createNotification(
-          {
-            customerId: customer.id,
-            title: "تم تفعيل حسابك",
-            message: "تم إعادة تفعيل حسابك ويمكنك الآن تسجيل الدخول مجدداً.",
-            type: "success",
-          },
-          tx,
-        );
-      }
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: raw.action === "suspend" ? "customer.suspended" : "customer.activated",
+      entityType: "profile",
+      entityId: customer.id,
+      metadata: { reason: raw.reason || undefined, previous: customer.account_status },
     });
+
+    if (nextStatus === "active") {
+      await createNotification({
+        customerId: customer.id,
+        title: "تم تفعيل حسابك",
+        message: "تم إعادة تفعيل حسابك ويمكنك الآن تسجيل الدخول مجدداً.",
+        type: "success",
+      });
+    }
   } catch (error) {
     console.error("[admin] set customer status failed", error);
     return { ok: false, message: "تعذّر تنفيذ الإجراء." };
@@ -123,8 +106,8 @@ export async function setCustomerStatusAction(
     ok: true,
     message:
       nextStatus === "suspended"
-        ? `تم إيقاف حساب ${customer.fullName} وإلغاء جلساته.`
-        : `تم تفعيل حساب ${customer.fullName}.`,
+        ? `تم إيقاف حساب ${customer.full_name} وإلغاء جلساته.`
+        : `تم تفعيل حساب ${customer.full_name}.`,
   };
 }
 
@@ -146,9 +129,9 @@ const statusSchema = z.object({
 });
 
 /**
- * Move a shipment to a new status, guarded by the admin-configurable
- * transition matrix and the restricted-status rule. Writes an idempotent
- * event so a retry can never duplicate the timeline entry.
+ * Move a shipment to a new status via the `transition_shipment` SECURITY
+ * DEFINER RPC, which validates against the admin-configurable transition
+ * matrix and writes one idempotent timeline event atomically.
  */
 export async function changeShipmentStatusAction(
   _prev: ActionState,
@@ -181,27 +164,22 @@ export async function changeShipmentStatusAction(
     return { ok: false, message: "هذه الحالة مقصورة على المدير العام." };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select({
-      id: shipments.id,
-      trackingNumber: shipments.trackingNumber,
-      currentStatus: shipments.currentStatus,
-      customerId: shipments.customerId,
-    })
-    .from(shipments)
-    .where(eq(shipments.id, parsed.data.shipmentId))
-    .limit(1);
-  const shipment = rows[0];
+  const supabase = await createClient();
+  const { data: shipment } = await supabase
+    .from("shipments")
+    .select("id, tracking_number, current_status, customer_id")
+    .eq("id", parsed.data.shipmentId)
+    .maybeSingle();
   if (!shipment) return { ok: false, message: "الشحنة غير موجودة." };
 
-  if (shipment.currentStatus === parsed.data.toStatus) {
+  if (shipment.current_status === parsed.data.toStatus) {
     return { ok: false, message: "الشحنة على هذه الحالة بالفعل." };
   }
 
-  const allowed = await canTransition(shipment.currentStatus, parsed.data.toStatus);
+  const allowed = await canTransition(shipment.current_status, parsed.data.toStatus);
   if (!allowed) {
-    const fromLabel = catalog.get(shipment.currentStatus)?.labelAr ?? shipment.currentStatus;
+    const fromLabel =
+      catalog.get(shipment.current_status)?.labelAr ?? shipment.current_status;
     return {
       ok: false,
       message: `لا يُسمح بالانتقال من «${fromLabel}» إلى «${target.labelAr}». عدّل مصفوفة الانتقالات من صفحة حالات الشحن.`,
@@ -209,67 +187,50 @@ export async function changeShipmentStatusAction(
   }
 
   try {
-    await withTransaction(async (tx) => {
-      const now = new Date();
-      await tx
-        .update(shipments)
-        .set({
-          currentStatus: parsed.data.toStatus,
-          statusGroup: target.group,
-          updatedAt: now,
-          ...(parsed.data.estimatedDeliveryDate
-            ? { estimatedDeliveryDate: parsed.data.estimatedDeliveryDate, estimatedDelivery: true }
-            : {}),
-        })
-        .where(eq(shipments.id, shipment.id));
-
-      // Idempotency key: same shipment + status + timestamp bucket => one row.
-      const bucket = Math.floor(now.getTime() / 1000);
-      await tx
-        .insert(shipmentEvents)
-        .values({
-          id: randomUUID(),
-          shipmentId: shipment.id,
-          status: parsed.data.toStatus,
-          statusGroup: target.group,
-          location: parsed.data.location || null,
-          description: parsed.data.description,
-          eventTimestamp: now,
-          source: "staff",
-          createdBy: session.profileId,
-          idempotencyKey: `${shipment.id}:${parsed.data.toStatus}:${bucket}`,
-        })
-        .onConflictDoNothing({ target: shipmentEvents.idempotencyKey });
-
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "shipment.status_changed",
-          entityType: "shipment",
-          entityId: shipment.id,
-          metadata: {
-            from: shipment.currentStatus,
-            to: parsed.data.toStatus,
-            trackingNumber: shipment.trackingNumber,
-          },
-        },
-        tx,
-      );
-
-      if (shipment.customerId) {
-        await createNotification(
-          {
-            customerId: shipment.customerId,
-            title: `تحديث حالة الشحنة ${shipment.trackingNumber}`,
-            message: parsed.data.description,
-            type: target.isException ? "warning" : "info",
-            link: `/shipments/${shipment.id}`,
-          },
-          tx,
-        );
-      }
+    const { error } = await supabase.rpc("transition_shipment", {
+      p_shipment_id: shipment.id,
+      p_to_status: parsed.data.toStatus,
+      p_location: parsed.data.location || null,
+      p_description: parsed.data.description,
+      p_expected_from: shipment.current_status,
     });
+    if (error) throw new Error(error.message);
+
+    // The RPC has no estimated-date parameter; set it directly (RLS allows
+    // ops/warehouse to update shipments).
+    if (parsed.data.estimatedDeliveryDate) {
+      const { error: dateError } = await supabase
+        .from("shipments")
+        .update({
+          estimated_delivery_date: parsed.data.estimatedDeliveryDate,
+          estimated_delivery: true,
+        })
+        .eq("id", shipment.id);
+      if (dateError) throw new Error(dateError.message);
+    }
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "shipment.status_changed",
+      entityType: "shipment",
+      entityId: shipment.id,
+      metadata: {
+        from: shipment.current_status,
+        to: parsed.data.toStatus,
+        trackingNumber: shipment.tracking_number,
+      },
+    });
+
+    if (shipment.customer_id) {
+      await createNotification({
+        customerId: shipment.customer_id,
+        title: `تحديث حالة الشحنة ${shipment.tracking_number}`,
+        message: parsed.data.description,
+        type: target.isException ? "warning" : "info",
+        link: `/shipments/${shipment.id}`,
+      });
+    }
   } catch (error) {
     console.error("[admin] status change failed", error);
     return { ok: false, message: "تعذّر تغيير الحالة." };
@@ -287,13 +248,14 @@ export async function changeShipmentStatusAction(
 const claimReviewSchema = z.object({
   claimId: z.string().min(1),
   decision: z.enum(["approve", "reject"]),
+  shipmentTrackingNumber: z.string().trim().max(40).optional(),
   reviewNote: z.string().trim().max(500).optional(),
 });
 
 /**
- * Approve or reject a shipment claim. Approval re-checks that no other open
- * claim holds the shipment (the unique index is the final guard) and links it
- * to the claimant inside one transaction.
+ * Approve or reject a shipment claim via the `approve_claim` / `reject_claim`
+ * SECURITY DEFINER RPCs. Approval resolves the staff-entered tracking number
+ * to a real shipment and links it to the claimant atomically.
  */
 export async function reviewClaimAction(
   _prev: ActionState,
@@ -305,6 +267,7 @@ export async function reviewClaimAction(
   const raw = {
     claimId: String(formData.get("claimId") ?? ""),
     decision: String(formData.get("decision") ?? ""),
+    shipmentTrackingNumber: String(formData.get("shipmentTrackingNumber") ?? "").trim(),
     reviewNote: String(formData.get("reviewNote") ?? "").trim(),
   };
 
@@ -313,64 +276,80 @@ export async function reviewClaimAction(
     return { ok: false, message: "طلب مراجعة غير صالح.", errors: fieldErrors(parsed.error) };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(shipmentClaimRequests)
-    .where(eq(shipmentClaimRequests.id, parsed.data.claimId))
-    .limit(1);
-  const claim = rows[0];
+  const supabase = await createClient();
+  const { data: claim } = await supabase
+    .from("shipment_claim_requests")
+    .select("id, customer_id, shipment_id, shipment_tracking_number, carrier_tracking_number, request_status")
+    .eq("id", parsed.data.claimId)
+    .maybeSingle();
   if (!claim) return { ok: false, message: "طلب الربط غير موجود." };
-  if (!["pending", "auto_verified"].includes(claim.requestStatus)) {
+  if (claim.request_status !== "pending") {
     return { ok: false, message: "تمت مراجعة هذا الطلب بالفعل." };
   }
 
   const approve = parsed.data.decision === "approve";
 
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(shipmentClaimRequests)
-        .set({
-          requestStatus: approve ? "approved" : "rejected",
-          reviewNote: parsed.data.reviewNote || null,
-          reviewedAt: new Date(),
-          reviewedBy: session.profileId,
-        })
-        .where(eq(shipmentClaimRequests.id, claim.id));
-
-      if (approve && claim.shipmentId) {
-        await tx
-          .update(shipments)
-          .set({ customerId: claim.customerId, updatedAt: new Date() })
-          .where(eq(shipments.id, claim.shipmentId));
+    if (approve) {
+      // Resolve the staff-entered (or claim-stored) tracking number to a
+      // shipment; the RPC then links it to the claimant.
+      const tracking =
+        raw.shipmentTrackingNumber || claim.shipment_tracking_number || "";
+      const { data: shipment } = tracking
+        ? await supabase
+            .from("shipments")
+            .select("id, tracking_number")
+            .eq("tracking_number", tracking)
+            .maybeSingle()
+        : { data: null };
+      if (!shipment) {
+        return {
+          ok: false,
+          message: tracking
+            ? `لم يتم العثور على شحنة برقم ${tracking}. تأكّد من الرقم ثم أعد المحاولة.`
+            : "لا يمكن اعتماد الطلب دون رقم شحنة صحيح.",
+        };
       }
 
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: approve ? "shipment.claim.approved" : "shipment.claim.rejected",
-          entityType: "shipment_claim_request",
-          entityId: claim.id,
-          metadata: { shipmentId: claim.shipmentId, customerId: claim.customerId },
-        },
-        tx,
-      );
+      const { error } = await supabase.rpc("approve_claim", {
+        p_claim_id: claim.id,
+        p_shipment_id: shipment.id,
+        p_note: parsed.data.reviewNote || null,
+      });
+      if (error) throw new Error(error.message);
 
-      await createNotification(
-        {
-          customerId: claim.customerId,
-          title: approve ? "تم اعتماد طلب ربط الشحنة" : "تم رفض طلب ربط الشحنة",
-          message: approve
-            ? `تم ربط الشحنة ${claim.shipmentTrackingNumber ?? ""} بحسابك بنجاح.`
-            : (parsed.data.reviewNote ??
-              "لم نتمكن من التحقق من ملكية الشحنة. تواصل مع الدعم مع إرفاق إثبات الشراء."),
-          type: approve ? "success" : "warning",
-          link: approve && claim.shipmentId ? `/shipments/${claim.shipmentId}` : "/help",
-        },
-        tx,
-      );
+      await createNotification({
+        customerId: claim.customer_id,
+        title: "تم اعتماد طلب ربط الشحنة",
+        message: `تم ربط الشحنة ${shipment.tracking_number} بحسابك بنجاح.`,
+        type: "success",
+        link: `/shipments/${shipment.id}`,
+      });
+    } else {
+      const { error } = await supabase.rpc("reject_claim", {
+        p_claim_id: claim.id,
+        p_note: parsed.data.reviewNote || null,
+      });
+      if (error) throw new Error(error.message);
+
+      await createNotification({
+        customerId: claim.customer_id,
+        title: "تم رفض طلب ربط الشحنة",
+        message:
+          parsed.data.reviewNote ||
+          "لم نتمكن من التحقق من ملكية الشحنة. تواصل مع الدعم مع إرفاق إثبات الشراء.",
+        type: "warning",
+        link: "/help",
+      });
+    }
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: approve ? "shipment.claim.approved" : "shipment.claim.rejected",
+      entityType: "shipment_claim_request",
+      entityId: claim.id,
+      metadata: { customerId: claim.customer_id },
     });
   } catch (error) {
     console.error("[admin] claim review failed", error);
@@ -409,50 +388,40 @@ export async function replyTicketAction(
     return { ok: false, message: "راجع الحقول.", errors: fieldErrors(parsed.error) };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select({ id: supportTickets.id, customerId: supportTickets.customerId })
-    .from(supportTickets)
-    .where(eq(supportTickets.id, parsed.data.ticketId))
-    .limit(1);
-
-  const ticket = rows[0];
+  const supabase = await createClient();
+  const { data: ticket } = await supabase
+    .from("support_tickets")
+    .select("id, customer_id")
+    .eq("id", parsed.data.ticketId)
+    .maybeSingle();
   if (!ticket) return { ok: false, message: "التذكرة غير موجودة." };
 
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(supportTickets)
-        .set({
-          reply: parsed.data.reply,
-          repliedAt: new Date(),
-          status: "answered",
-          updatedAt: new Date(),
-          assignedTo: session.profileId,
-        })
-        .where(eq(supportTickets.id, ticket.id));
+    const { error } = await supabase
+      .from("support_tickets")
+      .update({
+        reply: parsed.data.reply,
+        replied_at: new Date().toISOString(),
+        status: "answered",
+        assigned_to: session.profileId,
+      })
+      .eq("id", ticket.id);
+    if (error) throw new Error(error.message);
 
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "support.ticket.replied",
-          entityType: "support_ticket",
-          entityId: ticket.id,
-        },
-        tx,
-      );
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "support.ticket.replied",
+      entityType: "support_ticket",
+      entityId: ticket.id,
+    });
 
-      await createNotification(
-        {
-          customerId: ticket.customerId,
-          title: "تم الرد على تذكرتك",
-          message: parsed.data.reply.slice(0, 200),
-          type: "info",
-          link: "/help",
-        },
-        tx,
-      );
+    await createNotification({
+      customerId: ticket.customer_id,
+      title: "تم الرد على تذكرتك",
+      message: parsed.data.reply.slice(0, 200),
+      type: "info",
+      link: "/help",
     });
   } catch (error) {
     console.error("[admin] ticket reply failed", error);
@@ -501,53 +470,48 @@ export async function registerPackageAction(
     return { ok: false, message: "راجع الحقول.", errors: fieldErrors(parsed.error) };
   }
 
-  const db = await getDb();
-  const customerRows = await db
-    .select({ id: profiles.id, fullName: profiles.fullName, accountStatus: profiles.accountStatus })
-    .from(profiles)
-    .where(eq(profiles.customerNumber, parsed.data.customerNumber.toUpperCase()))
-    .limit(1);
-  const customer = customerRows[0];
+  const supabase = await createClient();
+  const { data: customer } = await supabase
+    .from("profiles")
+    .select("id, full_name, account_status")
+    .eq("customer_number", parsed.data.customerNumber.toUpperCase())
+    .maybeSingle();
   if (!customer) {
-    return { ok: false, message: "لا يوجد عميل بهذا الرقم.", errors: { customerNumber: "رقم العميل غير موجود" } };
+    return {
+      ok: false,
+      message: "لا يوجد عميل بهذا الرقم.",
+      errors: { customerNumber: "رقم العميل غير موجود" },
+    };
   }
-  if (customer.accountStatus !== "active") {
+  if (customer.account_status !== "active") {
     return { ok: false, message: "حساب هذا العميل موقوف، لا يمكن تسجيل طرود عليه." };
   }
 
   try {
-    const reference = await withTransaction(async (tx) => {
-      const { nextPackageReference } = await import("@/server/ids");
-      const ref = await nextPackageReference(tx);
-      const id = randomUUID();
-      await tx.insert(packages).values({
-        id,
-        packageReference: ref,
-        customerId: customer.id,
-        carrierTrackingNumber: parsed.data.carrierTrackingNumber || null,
-        description: parsed.data.description || null,
-        weight: parsed.data.weight || null,
-        dimensions: parsed.data.dimensions || null,
-        packageStatus: "registered",
-        notes: parsed.data.notes || null,
-        receivedBy: session.profileId,
-      });
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "package.registered",
-          entityType: "package",
-          entityId: id,
-          metadata: { packageReference: ref, customerId: customer.id },
-        },
-        tx,
-      );
-      return ref;
+    const reference = await nextPackageReference();
+    const { error } = await supabase.from("shipment_packages").insert({
+      package_reference: reference,
+      customer_id: customer.id,
+      carrier_tracking_number: parsed.data.carrierTrackingNumber || null,
+      description: parsed.data.description || null,
+      weight: parsed.data.weight || null,
+      dimensions: parsed.data.dimensions || null,
+      package_status: "registered",
+      notes: parsed.data.notes || null,
+      received_by: session.profileId,
+    });
+    if (error) throw new Error(error.message);
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "package.registered",
+      entityType: "package",
+      metadata: { packageReference: reference, customerId: customer.id },
     });
 
     revalidatePath("/admin/warehouse");
-    return { ok: true, message: `تم تسجيل الطرد ${reference} للعميل ${customer.fullName}.` };
+    return { ok: true, message: `تم تسجيل الطرد ${reference} للعميل ${customer.full_name}.` };
   } catch (error) {
     console.error("[admin] register package failed", error);
     return { ok: false, message: "تعذّر تسجيل الطرد." };
@@ -562,45 +526,44 @@ export async function receivePackageAction(formData: FormData): Promise<void> {
   const id = String(formData.get("id") ?? "");
   if (!id) return;
 
-  const db = await getDb();
-  const rows = await db
-    .select({ id: packages.id, packageStatus: packages.packageStatus, customerId: packages.customerId, packageReference: packages.packageReference })
-    .from(packages)
-    .where(eq(packages.id, id))
-    .limit(1);
-  const pkg = rows[0];
-  if (!pkg || pkg.packageStatus !== "registered") return;
+  const supabase = await createClient();
+  const { data: pkg } = await supabase
+    .from("shipment_packages")
+    .select("id, package_status, customer_id, package_reference")
+    .eq("id", id)
+    .maybeSingle();
+  if (!pkg || pkg.package_status !== "registered") return;
 
-  await withTransaction(async (tx) => {
-    await tx
-      .update(packages)
-      .set({ packageStatus: "received", warehouseReceivedAt: new Date(), updatedAt: new Date(), receivedBy: session.profileId })
-      .where(eq(packages.id, pkg.id));
+  const { error } = await supabase
+    .from("shipment_packages")
+    .update({
+      package_status: "received",
+      warehouse_received_at: new Date().toISOString(),
+      received_by: session.profileId,
+    })
+    .eq("id", pkg.id);
+  if (error) {
+    console.error("[admin] receive package failed", error);
+    return;
+  }
 
-    await logAudit(
-      {
-        actorId: session.profileId,
-        actorLabel: session.fullName,
-        action: "package.received",
-        entityType: "package",
-        entityId: pkg.id,
-      },
-      tx,
-    );
-
-    if (pkg.customerId) {
-      await createNotification(
-        {
-          customerId: pkg.customerId,
-          title: "وصل طردك إلى المستودع",
-          message: `تم استلام الطرد ${pkg.packageReference} في مستودع قوانغتشو.`,
-          type: "success",
-          link: "/packages",
-        },
-        tx,
-      );
-    }
+  await logAudit({
+    actorId: session.profileId,
+    actorLabel: session.fullName,
+    action: "package.received",
+    entityType: "package",
+    entityId: pkg.id,
   });
+
+  if (pkg.customer_id) {
+    await createNotification({
+      customerId: pkg.customer_id,
+      title: "وصل طردك إلى المستودع",
+      message: `تم استلام الطرد ${pkg.package_reference} في مستودع قوانغتشو.`,
+      type: "success",
+      link: "/packages",
+    });
+  }
 
   revalidatePath("/admin/warehouse");
 }
@@ -637,69 +600,36 @@ export async function recordPaymentAction(
     return { ok: false, message: "راجع الحقول.", errors: fieldErrors(parsed.error) };
   }
 
-  const db = await getDb();
-  const rows = await db
-    .select({ id: shipments.id, trackingNumber: shipments.trackingNumber, customerId: shipments.customerId, shippingFee: shipments.shippingFee })
-    .from(shipments)
-    .where(eq(shipments.id, parsed.data.shipmentId))
-    .limit(1);
-  const shipment = rows[0];
+  const supabase = await createClient();
+  const { data: shipment } = await supabase
+    .from("shipments")
+    .select("id, tracking_number, customer_id")
+    .eq("id", parsed.data.shipmentId)
+    .maybeSingle();
   if (!shipment) return { ok: false, message: "الشحنة غير موجودة." };
 
   try {
-    await withTransaction(async (tx) => {
-      await tx.insert(shipmentPayments).values({
-        id: randomUUID(),
-        shipmentId: shipment.id,
-        amount: parsed.data.amount,
-        currency: "SAR",
-        paymentMethod: parsed.data.paymentMethod,
-        paymentStatus: "completed",
-        transactionReference: parsed.data.transactionReference || null,
-        notes: parsed.data.notes || null,
-        recordedBy: session.profileId,
-      });
-
-      // Flip the shipment to paid only when recorded fees are fully covered.
-      if (shipment.shippingFee) {
-        const paidRows = await tx
-          .select({ total: shipmentPayments.amount })
-          .from(shipmentPayments)
-          .where(eq(shipmentPayments.shipmentId, shipment.id));
-        const paid = paidRows.reduce((sum, row) => sum + Number(row.total), 0);
-        if (paid >= Number(shipment.shippingFee)) {
-          await tx
-            .update(shipments)
-            .set({ paymentStatus: "paid", updatedAt: new Date() })
-            .where(eq(shipments.id, shipment.id));
-        }
-      }
-
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "payment.recorded",
-          entityType: "shipment",
-          entityId: shipment.id,
-          metadata: { amount: parsed.data.amount, method: parsed.data.paymentMethod },
-        },
-        tx,
-      );
-
-      if (shipment.customerId) {
-        await createNotification(
-          {
-            customerId: shipment.customerId,
-            title: `تم تسجيل دفعة للشحنة ${shipment.trackingNumber}`,
-            message: `المبلغ ${parsed.data.amount} ر.س via ${parsed.data.paymentMethod}.`,
-            type: "success",
-            link: `/shipments/${shipment.id}`,
-          },
-          tx,
-        );
-      }
+    // record_payment() records the row as "verified", recomputes the shipment
+    // payment_status (paid / partially_paid / unpaid), and writes its own
+    // audit entry — all inside one database transaction.
+    const { error } = await supabase.rpc("record_payment", {
+      p_shipment_id: shipment.id,
+      p_amount: Number(parsed.data.amount),
+      p_method: parsed.data.paymentMethod,
+      p_reference: parsed.data.transactionReference || null,
+      p_notes: parsed.data.notes || null,
     });
+    if (error) throw new Error(error.message);
+
+    if (shipment.customer_id) {
+      await createNotification({
+        customerId: shipment.customer_id,
+        title: `تم تسجيل دفعة للشحنة ${shipment.tracking_number}`,
+        message: `المبلغ ${parsed.data.amount} ر.س via ${parsed.data.paymentMethod}.`,
+        type: "success",
+        link: `/shipments/${shipment.id}`,
+      });
+    }
   } catch (error) {
     console.error("[admin] record payment failed", error);
     return { ok: false, message: "تعذّر تسجيل الدفعة." };

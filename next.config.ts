@@ -15,12 +15,8 @@ const nextConfig: NextConfig = {
       validationLevel: "manual-warning",
     },
   },
-  /**
-   * PGlite resolves its WASM binary relative to its own module URL; bundling it
-   * with Turbopack breaks that resolution (`path ... Received an instance of
-   * URL`). `pg` ships native sockets and is on Next's default external list.
-   */
-  serverExternalPackages: ["@electric-sql/pglite", "pg"],
+  /* No native/database drivers are bundled: the app talks to Supabase over
+   * HTTPS with supabase-js (@supabase/ssr keeps it server-only). */
   turbopack: {
     rules: {
       "*.css": {

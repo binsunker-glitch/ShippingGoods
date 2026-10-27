@@ -1,13 +1,9 @@
 "use server";
 
-import { randomUUID } from "node:crypto";
-
-import { count, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { getDb, withTransaction } from "@/db/client";
-import { shipmentStatusCatalog, shipmentStatusTransitions, shipments } from "@/db/schema";
 import type { ActionState } from "@/lib/action-state";
+import { createClient } from "@/lib/supabase/server";
 import { logAudit } from "@/server/audit";
 import { requirePermissionAction } from "@/server/auth/guards";
 
@@ -21,8 +17,8 @@ function canonical(fromStatus: string, toStatus: string) {
 
 /**
  * Enable or disable one transition in the matrix. Disabled transitions are
- * refused by `canTransition()` everywhere, so the change takes effect
- * immediately for every staff member.
+ * refused by `canTransition()` everywhere (and by the `transition_shipment`
+ * RPC), so the change takes effect immediately for every staff member.
  */
 export async function setTransitionActiveAction(
   _prev: ActionState,
@@ -38,42 +34,32 @@ export async function setTransitionActiveAction(
   }
   const active = activeRaw === "true";
 
-  const db = await getDb();
-  const rows = await db
-    .select({
-      id: shipmentStatusTransitions.id,
-      fromStatus: shipmentStatusTransitions.fromStatus,
-      toStatus: shipmentStatusTransitions.toStatus,
-      isActive: shipmentStatusTransitions.isActive,
-    })
-    .from(shipmentStatusTransitions)
-    .where(eq(shipmentStatusTransitions.id, transitionId))
-    .limit(1);
+  const supabase = await createClient();
+  const { data: transition } = await supabase
+    .from("shipment_status_transitions")
+    .select("id, from_status, to_status, is_active")
+    .eq("id", transitionId)
+    .maybeSingle();
 
-  const transition = rows[0];
   if (!transition) return { ok: false, message: "الانتقال غير موجود." };
-  if (transition.isActive === active) {
+  if (transition.is_active === active) {
     return { ok: true, message: "هذه القيمة مضبوطة بالفعل — لا يوجد تحديث." };
   }
 
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(shipmentStatusTransitions)
-        .set({ isActive: active, updatedBy: session.profileId, updatedAt: new Date() })
-        .where(eq(shipmentStatusTransitions.id, transition.id));
+    const { error } = await supabase
+      .from("shipment_status_transitions")
+      .update({ is_active: active })
+      .eq("id", transition.id);
+    if (error) throw new Error(error.message);
 
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: active ? "status.transition_enabled" : "status.transition_disabled",
-          entityType: "status_transition",
-          entityId: transition.id,
-          metadata: { from: transition.fromStatus, to: transition.toStatus },
-        },
-        tx,
-      );
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: active ? "status.transition_enabled" : "status.transition_disabled",
+      entityType: "status_transition",
+      entityId: transition.id,
+      metadata: { from: transition.from_status, to: transition.to_status },
     });
   } catch (error) {
     console.error("[admin] set transition failed", error);
@@ -105,43 +91,32 @@ export async function addTransitionAction(
   if (!from || !to) return { ok: false, message: "اختر الحالة الحالية والحالة الجديدة." };
   if (from === to) return { ok: false, message: "لا يمكن أن تكون الحالة نفسها انتقالاً." };
 
-  const db = await getDb();
-  const catalogRows = await db
-    .select({ code: shipmentStatusCatalog.code, labelAr: shipmentStatusCatalog.labelAr })
-    .from(shipmentStatusCatalog)
-    .where(eq(shipmentStatusCatalog.isActive, true));
-  const known = new Set(catalogRows.map((row) => row.code));
+  const supabase = await createClient();
+  const { data: catalogRows } = await supabase
+    .from("shipment_status_catalog")
+    .select("code")
+    .eq("is_active", true);
+  const known = new Set((catalogRows ?? []).map((row) => row.code));
   if (!known.has(from) || !known.has(to)) {
     return { ok: false, message: "أحد الرمزين غير موجود في كتالوج الحالات." };
   }
 
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .insert(shipmentStatusTransitions)
-        .values({
-          id: randomUUID(),
-          fromStatus: from,
-          toStatus: to,
-          isActive: true,
-          updatedBy: session.profileId,
-        })
-        .onConflictDoUpdate({
-          target: [shipmentStatusTransitions.fromStatus, shipmentStatusTransitions.toStatus],
-          set: { isActive: true, updatedBy: session.profileId, updatedAt: new Date() },
-        });
-
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "status.transition_added",
-          entityType: "status_transition",
-          entityId: `${from}:${to}`,
-          metadata: { from, to },
-        },
-        tx,
+    // Upsert on the (from,to) unique index: insert or re-enable.
+    const { error } = await supabase
+      .from("shipment_status_transitions")
+      .upsert(
+        { from_status: from, to_status: to, is_active: true },
+        { onConflict: "from_status,to_status", ignoreDuplicates: false },
       );
+    if (error) throw new Error(error.message);
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "status.transition_added",
+      entityType: "status_transition",
+      metadata: { from, to },
     });
   } catch (error) {
     console.error("[admin] add transition failed", error);
@@ -158,6 +133,13 @@ export async function addTransitionAction(
 
 const FLAG_KEYS = ["isActive", "isException", "restricted"] as const;
 type FlagKey = (typeof FLAG_KEYS)[number];
+
+/** camelCase form flag -> actual catalog column. */
+const FLAG_COLUMNS: Record<FlagKey, string> = {
+  isActive: "is_active",
+  isException: "is_exception",
+  restricted: "restricted",
+};
 
 /**
  * Flip one flag on a catalogue status. Deactivating a status is refused while
@@ -179,22 +161,21 @@ export async function setStatusFlagAction(
   }
   const value = activeRaw === "true";
 
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(shipmentStatusCatalog)
-    .where(eq(shipmentStatusCatalog.code, code))
-    .limit(1);
-  const status = rows[0];
+  const supabase = await createClient();
+  const { data: status } = await supabase
+    .from("shipment_status_catalog")
+    .select("code, label_ar, is_active, is_exception, restricted")
+    .eq("code", code)
+    .maybeSingle();
   if (!status) return { ok: false, message: "الحالة غير موجودة." };
 
   // Guard: an in-use status cannot be removed from rotation.
   if (flag === "isActive" && !value) {
-    const inUse = await db
-      .select({ value: count() })
-      .from(shipments)
-      .where(eq(shipments.currentStatus, code));
-    if ((inUse[0]?.value ?? 0) > 0) {
+    const { count } = await supabase
+      .from("shipments")
+      .select("id", { count: "exact", head: true })
+      .eq("current_status", code);
+    if ((count ?? 0) > 0) {
       return {
         ok: false,
         message: "لا يمكن إيقاف حالة مستخدمة في شحنات حالية. غيّر حالات الشحنات أولاً.",
@@ -203,23 +184,26 @@ export async function setStatusFlagAction(
   }
 
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .update(shipmentStatusCatalog)
-        .set({ [flag]: value })
-        .where(eq(shipmentStatusCatalog.code, code));
+    const { error } = await supabase
+      .from("shipment_status_catalog")
+      .update({ [FLAG_COLUMNS[flag]]: value })
+      .eq("code", code);
+    if (error) throw new Error(error.message);
 
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: `status.flag_changed.${flag}`,
-          entityType: "status_catalog",
-          entityId: code,
-          metadata: { previous: status[flag], next: value },
-        },
-        tx,
-      );
+    const previous =
+      flag === "isActive"
+        ? status.is_active
+        : flag === "isException"
+          ? status.is_exception
+          : status.restricted;
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: `status.flag_changed.${flag}`,
+      entityType: "status_catalog",
+      entityId: null, // codes are text, not UUID; the code lives in metadata.
+      metadata: { code, previous, next: value },
     });
   } catch (error) {
     console.error("[admin] set status flag failed", error);
@@ -227,5 +211,5 @@ export async function setStatusFlagAction(
   }
 
   revalidatePath("/admin/statuses");
-  return { ok: true, message: `تم تحديث الحالة «${status.labelAr}».` };
+  return { ok: true, message: `تم تحديث الحالة «${status.label_ar}».` };
 }

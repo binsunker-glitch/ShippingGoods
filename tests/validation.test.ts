@@ -158,9 +158,10 @@ describe("registerSchema", () => {
     expect(registerSchema.safeParse({ ...valid, buildingNumber: "12ج" }).success).toBe(false);
   });
 
-  it("allows an empty email but rejects a malformed one", () => {
-    expect(registerSchema.safeParse({ ...valid, email: "" }).success).toBe(true);
+  it("requires an email (Supabase Auth credential) and rejects malformed ones", () => {
+    expect(registerSchema.safeParse({ ...valid, email: "" }).success).toBe(false);
     expect(registerSchema.safeParse({ ...valid, email: "not-an-email" }).success).toBe(false);
+    expect(registerSchema.safeParse(valid).success).toBe(true);
   });
 
   it("emits Arabic validation messages only", () => {

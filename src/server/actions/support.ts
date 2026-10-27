@@ -1,14 +1,10 @@
 "use server";
 
-import { randomUUID } from "node:crypto";
-
-import { and, eq, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { getDb, withTransaction } from "@/db/client";
-import { notifications, supportTickets } from "@/db/schema";
 import type { ActionState } from "@/lib/action-state";
 import { fieldErrors, ticketSchema } from "@/lib/validation";
+import { createClient } from "@/lib/supabase/server";
 import { logAudit } from "@/server/audit";
 import { requireCustomerAction } from "@/server/auth/guards";
 import { nextTicketNumber } from "@/server/ids";
@@ -54,31 +50,30 @@ export async function createTicketAction(
     };
   }
 
+  const supabase = await createClient();
   try {
-    const ticketNumber = await withTransaction(async (tx) => {
-      const number = await nextTicketNumber(tx);
-      const id = randomUUID();
-      await tx.insert(supportTickets).values({
-        id,
-        customerId: session.profileId,
-        ticketNumber: number,
+    const ticketNumber = await nextTicketNumber();
+    const { data, error } = await supabase
+      .from("support_tickets")
+      .insert({
+        customer_id: session.profileId,
+        ticket_number: ticketNumber,
         subject: parsed.data.subject,
         description: parsed.data.description,
         status: "open",
         priority: parsed.data.priority,
-      });
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "support.ticket.created",
-          entityType: "support_ticket",
-          entityId: id,
-          metadata: { ticketNumber: number, priority: parsed.data.priority },
-        },
-        tx,
-      );
-      return number;
+      })
+      .select("id")
+      .single();
+    if (error) throw new Error(error.message);
+
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "support.ticket.created",
+      entityType: "support_ticket",
+      entityId: data.id,
+      metadata: { ticketNumber, priority: parsed.data.priority },
     });
 
     revalidatePath("/help");
@@ -100,13 +95,12 @@ export async function markNotificationReadAction(formData: FormData): Promise<vo
   const id = String(formData.get("id") ?? "");
   if (!id) return;
 
-  const db = await getDb();
-  await db
-    .update(notifications)
-    .set({ readAt: new Date() })
-    .where(
-      and(eq(notifications.id, id), eq(notifications.customerId, session.profileId)),
-    );
+  const supabase = await createClient();
+  await supabase
+    .from("notifications")
+    .update({ read_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("customer_id", session.profileId);
 
   revalidatePath("/notifications");
 }
@@ -116,13 +110,12 @@ export async function markAllNotificationsReadAction(): Promise<void> {
   const session = await requireCustomerAction();
   if (!session) return;
 
-  const db = await getDb();
-  await db
-    .update(notifications)
-    .set({ readAt: new Date() })
-    .where(
-      and(eq(notifications.customerId, session.profileId), isNull(notifications.readAt)),
-    );
+  const supabase = await createClient();
+  await supabase
+    .from("notifications")
+    .update({ read_at: new Date().toISOString() })
+    .eq("customer_id", session.profileId)
+    .is("read_at", null);
 
   revalidatePath("/notifications");
   revalidatePath("/dashboard");

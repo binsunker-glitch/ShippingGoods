@@ -15,9 +15,9 @@ export const metadata = { title: "طلبات ربط الطرود" };
 const STATUS_TABS = [
   { label: "الكل", value: "all" },
   { label: "قيد المراجعة", value: "pending" },
-  { label: "تم التحقق تلقائياً", value: "auto_verified" },
   { label: "معتمد", value: "approved" },
   { label: "مرفوض", value: "rejected" },
+  { label: "ملغي", value: "cancelled" },
 ];
 
 type Search = { status?: string; page?: string };
@@ -101,7 +101,7 @@ export default async function AdminClaimsPage({
       ) : (
         <div className="space-y-4">
           {result.rows.map((claim) => {
-            const open = ["pending", "auto_verified"].includes(claim.requestStatus);
+            const open = claim.requestStatus === "pending";
             return (
               <Card key={claim.id}>
                 <CardContent className="grid gap-5 lg:grid-cols-[1fr_320px]">

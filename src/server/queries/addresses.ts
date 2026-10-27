@@ -1,10 +1,9 @@
 import "server-only";
 
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
-
-import { getDb } from "@/db/client";
-import { customerAddresses, shipments } from "@/db/schema";
+import { statusCodesForGroups } from "@/lib/constants";
+import { createClient } from "@/lib/supabase/server";
 import type { AddressInput } from "@/lib/validation";
+import type { StatusGroup } from "@/db/schema";
 
 export const ACTIVE_SHIPMENT_GROUPS = [
   "warehouse",
@@ -12,71 +11,143 @@ export const ACTIVE_SHIPMENT_GROUPS = [
   "awaiting_payment",
   "in_transit",
   "exception",
-] as const;
+] as const satisfies readonly StatusGroup[];
 
-export async function listAddresses(customerId: string) {
-  const db = await getDb();
-  return db
-    .select()
-    .from(customerAddresses)
-    .where(eq(customerAddresses.customerId, customerId))
-    .orderBy(desc(customerAddresses.isDefault), desc(customerAddresses.updatedAt));
+/** camelCase address shape consumed by the UI (mirrors the old Drizzle row). */
+export type AddressRow = {
+  id: string;
+  label: string | null;
+  recipientName: string;
+  phone: string;
+  city: string;
+  district: string;
+  street: string;
+  buildingNumber: string;
+  secondaryNumber: string | null;
+  postalCode: string;
+  nationalAddressShortCode: string | null;
+  addressDetails: string | null;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type RawAddress = {
+  id: string;
+  label: string | null;
+  recipient_name: string;
+  phone: string;
+  city: string;
+  district: string | null;
+  street: string | null;
+  building_number: string | null;
+  secondary_number: string | null;
+  postal_code: string | null;
+  national_address_short_code: string | null;
+  address_details: string | null;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+const ADDRESS_COLUMNS =
+  "id, label, recipient_name, phone, city, district, street, building_number, secondary_number, postal_code, national_address_short_code, address_details, is_default, created_at, updated_at";
+
+function toAddress(row: RawAddress): AddressRow {
+  return {
+    id: row.id,
+    label: row.label,
+    recipientName: row.recipient_name,
+    phone: row.phone,
+    city: row.city,
+    district: row.district ?? "",
+    street: row.street ?? "",
+    buildingNumber: row.building_number ?? "",
+    secondaryNumber: row.secondary_number,
+    postalCode: row.postal_code ?? "",
+    nationalAddressShortCode: row.national_address_short_code,
+    addressDetails: row.address_details,
+    isDefault: row.is_default,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
-export type AddressWithLock = Awaited<ReturnType<typeof listAddressesWithLock>>[number];
+export async function listAddresses(customerId: string): Promise<AddressRow[]> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("customer_addresses")
+    .select(ADDRESS_COLUMNS)
+    .eq("customer_id", customerId)
+    .order("is_default", { ascending: false })
+    .order("updated_at", { ascending: false });
+
+  return (data ?? []).map(toAddress);
+}
+
+export type AddressWithLock = AddressRow & { locked: boolean };
 
 /**
- * One round trip: every address of the customer plus whether it is locked to
- * an active shipment, so the list page can disable deletion without N+1.
+ * Every address of the customer plus whether it is locked to an active
+ * shipment, so the list page can disable deletion without N+1.
  */
-export async function listAddressesWithLock(customerId: string) {
-  const db = await getDb();
-  return db
-    .select({
-      id: customerAddresses.id,
-      label: customerAddresses.label,
-      recipientName: customerAddresses.recipientName,
-      phone: customerAddresses.phone,
-      city: customerAddresses.city,
-      district: customerAddresses.district,
-      street: customerAddresses.street,
-      buildingNumber: customerAddresses.buildingNumber,
-      secondaryNumber: customerAddresses.secondaryNumber,
-      postalCode: customerAddresses.postalCode,
-      nationalAddressShortCode: customerAddresses.nationalAddressShortCode,
-      addressDetails: customerAddresses.addressDetails,
-      isDefault: customerAddresses.isDefault,
-      updatedAt: customerAddresses.updatedAt,
-      locked: sql<boolean>`exists (
-        select 1 from ${shipments}
-        where ${shipments.addressId} = ${customerAddresses.id}
-          and ${shipments.statusGroup} in ('warehouse','ready','awaiting_payment','in_transit','exception')
-      )`,
-    })
-    .from(customerAddresses)
-    .where(eq(customerAddresses.customerId, customerId))
-    .orderBy(desc(customerAddresses.isDefault), desc(customerAddresses.updatedAt));
+export async function listAddressesWithLock(customerId: string): Promise<AddressWithLock[]> {
+  const supabase = await createClient();
+  const activeCodes = statusCodesForGroups([...ACTIVE_SHIPMENT_GROUPS]);
+
+  const [addressesRes, shipmentsRes] = await Promise.all([
+    supabase
+      .from("customer_addresses")
+      .select(ADDRESS_COLUMNS)
+      .eq("customer_id", customerId)
+      .order("is_default", { ascending: false })
+      .order("updated_at", { ascending: false }),
+    // Shipments bound to an address in an active group => that address is locked.
+    supabase
+      .from("shipments")
+      .select("address_id")
+      .eq("customer_id", customerId)
+      .not("address_id", "is", null)
+      .in("current_status", activeCodes),
+  ]);
+
+  const locked = new Set(
+    (shipmentsRes.data ?? [])
+      .map((row) => row.address_id)
+      .filter((v): v is string => Boolean(v)),
+  );
+
+  return (addressesRes.data ?? []).map((row) => ({
+    ...toAddress(row),
+    locked: locked.has(row.id),
+  }));
 }
 
-export async function getDefaultAddress(customerId: string) {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(customerAddresses)
-    .where(eq(customerAddresses.customerId, customerId))
-    .orderBy(desc(customerAddresses.isDefault), desc(customerAddresses.updatedAt))
-    .limit(1);
-  return rows[0] ?? null;
+export async function getDefaultAddress(customerId: string): Promise<AddressRow | null> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("customer_addresses")
+    .select(ADDRESS_COLUMNS)
+    .eq("customer_id", customerId)
+    .order("is_default", { ascending: false })
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data ? toAddress(data) : null;
 }
 
-export async function getAddress(customerId: string, id: string) {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(customerAddresses)
-    .where(and(eq(customerAddresses.id, id), eq(customerAddresses.customerId, customerId)))
-    .limit(1);
-  return rows[0] ?? null;
+export async function getAddress(customerId: string, id: string): Promise<AddressRow | null> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("customer_addresses")
+    .select(ADDRESS_COLUMNS)
+    .eq("id", id)
+    .eq("customer_id", customerId)
+    .limit(1)
+    .maybeSingle();
+
+  return data ? toAddress(data) : null;
 }
 
 /**
@@ -84,42 +155,41 @@ export async function getAddress(customerId: string, id: string) {
  * confirmed snapshot on the shipment is never modified by address changes.
  */
 export async function isAddressLocked(addressId: string): Promise<boolean> {
-  const db = await getDb();
-  const rows = await db
-    .select({ id: shipments.id })
-    .from(shipments)
-    .where(
-      and(
-        eq(shipments.addressId, addressId),
-        inArray(shipments.statusGroup, [...ACTIVE_SHIPMENT_GROUPS]),
-      ),
-    )
-    .limit(1);
-  return rows.length > 0;
+  const supabase = await createClient();
+  const activeCodes = statusCodesForGroups([...ACTIVE_SHIPMENT_GROUPS]);
+
+  const { count } = await supabase
+    .from("shipments")
+    .select("id", { count: "exact", head: true })
+    .eq("address_id", addressId)
+    .in("current_status", activeCodes);
+
+  return (count ?? 0) > 0;
 }
 
 export async function countAddresses(customerId: string): Promise<number> {
-  const db = await getDb();
-  const rows = await db
-    .select({ id: customerAddresses.id })
-    .from(customerAddresses)
-    .where(eq(customerAddresses.customerId, customerId));
-  return rows.length;
+  const supabase = await createClient();
+  const { count } = await supabase
+    .from("customer_addresses")
+    .select("id", { count: "exact", head: true })
+    .eq("customer_id", customerId);
+  return count ?? 0;
 }
 
+/** Maps validated input to snake_case DB columns for insert/update. */
 export function addressToValues(input: AddressInput) {
   return {
     label: input.label || null,
-    recipientName: input.recipientName,
+    recipient_name: input.recipientName,
     phone: input.phone,
     city: input.city,
     district: input.district,
     street: input.street,
-    buildingNumber: input.buildingNumber,
-    secondaryNumber: input.secondaryNumber || null,
-    postalCode: input.postalCode,
-    nationalAddressShortCode: input.nationalAddressShortCode || null,
-    addressDetails: input.addressDetails || null,
-    isDefault: input.isDefault ?? false,
+    building_number: input.buildingNumber,
+    secondary_number: input.secondaryNumber || null,
+    postal_code: input.postalCode,
+    national_address_short_code: input.nationalAddressShortCode || null,
+    address_details: input.addressDetails || null,
+    is_default: input.isDefault ?? false,
   };
 }

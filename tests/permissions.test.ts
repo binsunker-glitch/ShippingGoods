@@ -46,28 +46,28 @@ describe("role / permission matrix", () => {
   });
 
   it("gives finance money-related permissions only", () => {
-    expect(can("finance", "payments.write")).toBe(true);
-    expect(can("finance", "shipments.fees")).toBe(true);
-    expect(can("finance", "audit.read")).toBe(true);
-    expect(can("finance", "shipments.status")).toBe(false);
-    expect(can("finance", "customers.suspend")).toBe(false);
-    expect(can("finance", "warehouse.write")).toBe(false);
-    expect(can("finance", "claims.review")).toBe(false);
+    expect(can("finance_staff", "payments.write")).toBe(true);
+    expect(can("finance_staff", "shipments.fees")).toBe(true);
+    expect(can("finance_staff", "audit.read")).toBe(true);
+    expect(can("finance_staff", "shipments.status")).toBe(false);
+    expect(can("finance_staff", "customers.suspend")).toBe(false);
+    expect(can("finance_staff", "warehouse.write")).toBe(false);
+    expect(can("finance_staff", "claims.review")).toBe(false);
   });
 
   it("gives support read + reply but never destructive writes", () => {
-    expect(can("support", "support.reply")).toBe(true);
-    expect(can("support", "customers.read")).toBe(true);
-    expect(can("support", "customers.suspend")).toBe(false);
-    expect(can("support", "shipments.status")).toBe(false);
-    expect(can("support", "payments.write")).toBe(false);
+    expect(can("customer_support", "support.reply")).toBe(true);
+    expect(can("customer_support", "customers.read")).toBe(true);
+    expect(can("customer_support", "customers.suspend")).toBe(false);
+    expect(can("customer_support", "shipments.status")).toBe(false);
+    expect(can("customer_support", "payments.write")).toBe(false);
   });
 
   it("lets only super admin and operations manage the status matrix", () => {
     expect(can("super_admin", "statuses.manage")).toBe(true);
     expect(can("operations_manager", "statuses.manage")).toBe(true);
-    expect(can("support", "statuses.manage")).toBe(false);
-    expect(can("finance", "statuses.manage")).toBe(false);
+    expect(can("customer_support", "statuses.manage")).toBe(false);
+    expect(can("finance_staff", "statuses.manage")).toBe(false);
     expect(can("warehouse_staff", "statuses.manage")).toBe(false);
   });
 
@@ -92,7 +92,7 @@ describe("admin navigation filtering", () => {
     expect(hrefs).not.toContain("/admin/audit");
     expect(hrefs).not.toContain("/admin/customers");
 
-    const financeNav = adminNavigation("finance").map((item) => item.href);
+    const financeNav = adminNavigation("finance_staff").map((item) => item.href);
     expect(financeNav).toContain("/admin/payments");
     expect(financeNav).not.toContain("/admin/statuses");
     expect(financeNav).not.toContain("/admin/support");
@@ -108,8 +108,8 @@ describe("admin navigation filtering", () => {
       "super_admin",
       "operations_manager",
       "warehouse_staff",
-      "support",
-      "finance",
+      "customer_support",
+      "finance_staff",
     ] as const;
     for (const item of ADMIN_NAV) {
       expect(roles.some((role) => can(role, item.permission))).toBe(true);

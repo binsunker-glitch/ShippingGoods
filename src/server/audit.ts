@@ -1,10 +1,6 @@
 import "server-only";
 
-import { randomUUID } from "node:crypto";
-
-import { getDb } from "@/db/client";
-import type { Tx } from "@/db/client";
-import { auditLogs } from "@/db/schema";
+import { createClient } from "@/lib/supabase/server";
 
 const SENSITIVE_KEY = /(password|token|secret|cookie|authorization|cvv|card_number|otp)/i;
 
@@ -35,18 +31,22 @@ export type AuditInput = {
 };
 
 /**
- * Appends an immutable audit record. Every sensitive operation
- * (status change, ownership change, payment, role change) must call this.
+ * Appends an immutable audit record through the `log_audit` SECURITY DEFINER
+ * function (see the migrations). The database always records the actor as
+ * `auth.uid()` — a client can never impersonate another actor. Sensitive keys
+ * are redacted here *and* again inside the function.
  */
-export async function logAudit(input: AuditInput, tx?: Tx): Promise<void> {
-  const executor = tx ?? (await getDb());
-  await executor.insert(auditLogs).values({
-    id: randomUUID(),
-    actorId: input.actorId ?? null,
-    actorLabel: input.actorLabel ?? null,
-    action: input.action,
-    entityType: input.entityType,
-    entityId: input.entityId ?? null,
-    metadata: sanitize(input.metadata),
-  });
+export async function logAudit(input: AuditInput): Promise<void> {
+  try {
+    const supabase = await createClient();
+    await supabase.rpc("log_audit", {
+      p_action: input.action,
+      p_entity_type: input.entityType,
+      p_entity_id: input.entityId ?? null,
+      p_metadata: sanitize(input.metadata),
+    });
+  } catch (error) {
+    // Auditing must never break the primary operation, but failures are loud.
+    console.error("[audit] failed to write audit log", error);
+  }
 }

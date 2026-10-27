@@ -1,18 +1,6 @@
 import "server-only";
 
-import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
-
-import { getDb } from "@/db/client";
-import {
-  consolidationGroups,
-  consolidationItems,
-  notifications,
-  packages,
-  shipmentClaimRequests,
-  shipmentPackages,
-  shipments,
-  supportTickets,
-} from "@/db/schema";
+import { createClient } from "@/lib/supabase/server";
 
 /* ------------------------------------------------------------------ */
 /* Packages (customer view of warehouse inventory)                     */
@@ -26,8 +14,8 @@ export type CustomerPackage = {
   weight: string | null;
   dimensions: string | null;
   packageStatus: string;
-  warehouseReceivedAt: Date | null;
-  createdAt: Date;
+  warehouseReceivedAt: string | null;
+  createdAt: string;
   /** The shipment this package currently belongs to, if any. */
   shipmentId: string | null;
   shipmentTrackingNumber: string | null;
@@ -35,6 +23,23 @@ export type CustomerPackage = {
 };
 
 export type PackageFilters = { status?: string; page?: number; perPage?: number };
+
+function str(value: unknown): string | null {
+  return value === null || value === undefined ? null : String(value);
+}
+
+function dimToStr(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+const PACKAGE_COLUMNS =
+  "id, package_reference, carrier_tracking_number, description, weight, dimensions, package_status, warehouse_received_at, created_at, shipment_id";
 
 /** Paged, strictly customer-scoped package list. */
 export async function listCustomerPackages(
@@ -47,61 +52,91 @@ export async function listCustomerPackages(
   totalPages: number;
   counts: Record<string, number>;
 }> {
-  const db = await getDb();
+  const supabase = await createClient();
   const page = Math.max(1, filters.page ?? 1);
   const perPage = Math.max(1, Math.min(50, filters.perPage ?? 12));
+  const status = filters.status && filters.status !== "all" ? filters.status : null;
 
-  const status = filters.status && filters.status !== "all" ? filters.status : undefined;
-  const where = status
-    ? and(eq(packages.customerId, customerId), eq(packages.packageStatus, status as never))
-    : eq(packages.customerId, customerId);
+  const countQuery = supabase
+    .from("shipment_packages")
+    .select("id", { count: "exact", head: true })
+    .eq("customer_id", customerId);
+  if (status) countQuery.eq("package_status", status);
 
-  const totalRows = await db.select({ value: count() }).from(packages).where(where);
-  const total = Number(totalRows[0]?.value ?? 0);
+  const rowsQuery = supabase
+    .from("shipment_packages")
+    .select(PACKAGE_COLUMNS)
+    .eq("customer_id", customerId);
+  if (status) rowsQuery.eq("package_status", status);
+  rowsQuery.order("created_at", { ascending: false });
+  const from = (page - 1) * perPage;
+  rowsQuery.range(from, from + perPage - 1);
 
-  const rows = await db
-    .select({
-      id: packages.id,
-      packageReference: packages.packageReference,
-      carrierTrackingNumber: packages.carrierTrackingNumber,
-      description: packages.description,
-      weight: packages.weight,
-      dimensions: packages.dimensions,
-      packageStatus: packages.packageStatus,
-      warehouseReceivedAt: packages.warehouseReceivedAt,
-      createdAt: packages.createdAt,
-    })
-    .from(packages)
-    .where(where)
-    .orderBy(desc(packages.createdAt))
-    .limit(perPage)
-    .offset((page - 1) * perPage);
+  const allQuery = supabase
+    .from("shipment_packages")
+    .select("package_status")
+    .eq("customer_id", customerId);
 
-  // Package -> shipment and package -> consolidation links, resolved in two
-  // extra round trips so the main list query stays a simple indexed select.
-  const ids = rows.map((row) => row.id);
-  const [links, groupRefs] = await Promise.all([
-    getPackageShipmentLinks(customerId, ids),
-    getPackageConsolidationRefs(ids),
-  ]);
+  const [countRes, rowsRes, allRes] = await Promise.all([countQuery, rowsQuery, allQuery]);
+  const total = countRes.count ?? 0;
 
-  const enriched: CustomerPackage[] = rows.map((row) => ({
-    ...row,
-    shipmentId: links.get(row.id)?.shipmentId ?? null,
-    shipmentTrackingNumber: links.get(row.id)?.trackingNumber ?? null,
-    consolidationGroupReference: groupRefs.get(row.id) ?? null,
-  }));
-
-  const groupCounts = await db
-    .select({ status: packages.packageStatus, value: count() })
-    .from(packages)
-    .where(eq(packages.customerId, customerId))
-    .groupBy(packages.packageStatus);
+  // Resolve shipment tracking numbers for the page's linked packages.
+  const rows = rowsRes.data ?? [];
+  const shipmentIds = [
+    ...new Set(rows.map((r) => r.shipment_id).filter((v): v is string => Boolean(v))),
+  ];
+  const trackingByShipment = new Map<string, string>();
+  if (shipmentIds.length > 0) {
+    const { data } = await supabase
+      .from("shipments")
+      .select("id, tracking_number")
+      .in("id", shipmentIds);
+    for (const s of data ?? []) trackingByShipment.set(s.id, s.tracking_number);
+  }
 
   const counts: Record<string, number> = { all: 0 };
-  for (const row of groupCounts) {
-    counts[row.status] = Number(row.value);
-    counts.all += Number(row.value);
+  for (const row of allRes.data ?? []) {
+    counts[row.package_status] = (counts[row.package_status] ?? 0) + 1;
+    counts.all += 1;
+  }
+
+  const enriched: CustomerPackage[] = rows.map((row) => ({
+    id: row.id,
+    packageReference: row.package_reference,
+    carrierTrackingNumber: row.carrier_tracking_number,
+    description: row.description,
+    weight: str(row.weight),
+    dimensions: dimToStr(row.dimensions),
+    packageStatus: row.package_status,
+    warehouseReceivedAt: row.warehouse_received_at,
+    createdAt: row.created_at,
+    shipmentId: row.shipment_id,
+    shipmentTrackingNumber: row.shipment_id
+      ? trackingByShipment.get(row.shipment_id) ?? null
+      : null,
+    consolidationGroupReference: null, // resolved below only when linked
+  }));
+
+  // Package -> open consolidation group reference.
+  const ids = enriched.map((r) => r.id);
+  if (ids.length > 0) {
+    const { data: items } = await supabase
+      .from("consolidation_items")
+      .select("package_id, consolidation_groups!inner(group_code, status)")
+      .in("package_id", ids)
+      .eq("consolidation_groups.status", "open");
+    const refByPackage = new Map<string, string>();
+    for (const item of items ?? []) {
+      const grp = item.consolidation_groups as unknown as
+        | { group_code: string; status: string }
+        | { group_code: string; status: string }[]
+        | null;
+      const g = Array.isArray(grp) ? grp[0] : grp;
+      if (g) refByPackage.set(item.package_id, g.group_code);
+    }
+    for (const row of enriched) {
+      row.consolidationGroupReference = refByPackage.get(row.id) ?? null;
+    }
   }
 
   return {
@@ -111,60 +146,6 @@ export async function listCustomerPackages(
     totalPages: Math.max(1, Math.ceil(total / perPage)),
     counts,
   };
-}
-
-async function getPackageShipmentLinks(
-  customerId: string,
-  packageIds: string[],
-): Promise<Map<string, { shipmentId: string; trackingNumber: string }>> {
-  const map = new Map<string, { shipmentId: string; trackingNumber: string }>();
-  if (packageIds.length === 0) return map;
-
-  const db = await getDb();
-  const rows = await db
-    .select({
-      packageId: shipmentPackages.packageId,
-      shipmentId: shipments.id,
-      trackingNumber: shipments.trackingNumber,
-    })
-    .from(shipmentPackages)
-    .innerJoin(shipments, eq(shipmentPackages.shipmentId, shipments.id))
-    .where(
-      and(
-        inArray(shipmentPackages.packageId, packageIds),
-        eq(shipments.customerId, customerId),
-      ),
-    );
-
-  for (const row of rows) {
-    map.set(row.packageId, { shipmentId: row.shipmentId, trackingNumber: row.trackingNumber });
-  }
-  return map;
-}
-
-async function getPackageConsolidationRefs(
-  packageIds: string[],
-): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
-  if (packageIds.length === 0) return map;
-
-  const db = await getDb();
-  const rows = await db
-    .select({
-      packageId: consolidationItems.packageId,
-      reference: consolidationGroups.groupReference,
-    })
-    .from(consolidationItems)
-    .innerJoin(consolidationGroups, eq(consolidationItems.consolidationGroupId, consolidationGroups.id))
-    .where(
-      and(
-        inArray(consolidationItems.packageId, packageIds),
-        eq(consolidationGroups.status, "open"),
-      ),
-    );
-
-  for (const row of rows) map.set(row.packageId, row.reference);
-  return map;
 }
 
 /* ------------------------------------------------------------------ */
@@ -178,7 +159,7 @@ export type ConsolidationGroupView = {
   shipmentId: string | null;
   shipmentTrackingNumber: string | null;
   notes: string | null;
-  createdAt: Date;
+  createdAt: string;
   packageCount: number;
   totalWeight: string | null;
 };
@@ -186,65 +167,56 @@ export type ConsolidationGroupView = {
 export async function listConsolidationGroups(
   customerId: string,
 ): Promise<ConsolidationGroupView[]> {
-  const db = await getDb();
-  const groups = await db
-    .select({
-      id: consolidationGroups.id,
-      groupReference: consolidationGroups.groupReference,
-      status: consolidationGroups.status,
-      shipmentId: consolidationGroups.shipmentId,
-      notes: consolidationGroups.notes,
-      createdAt: consolidationGroups.createdAt,
-    })
-    .from(consolidationGroups)
-    .where(eq(consolidationGroups.customerId, customerId))
-    .orderBy(desc(consolidationGroups.createdAt));
+  const supabase = await createClient();
 
-  if (groups.length === 0) return [];
+  const { data: groups } = await supabase
+    .from("consolidation_groups")
+    .select("id, group_code, status, shipment_id, notes, created_at")
+    .eq("customer_id", customerId)
+    .order("created_at", { ascending: false });
 
-  const groupIds = groups.map((group) => group.id);
-  const items = await db
-    .select({
-      groupId: consolidationItems.consolidationGroupId,
-      packageId: consolidationItems.packageId,
-      weight: packages.weight,
-    })
-    .from(consolidationItems)
-    .innerJoin(packages, eq(consolidationItems.packageId, packages.id))
-    .where(inArray(consolidationItems.consolidationGroupId, groupIds));
+  if (!groups || groups.length === 0) return [];
 
-  const shipmentRefs = new Map<string, string>();
-  const linkedIds = groups
-    .map((group) => group.shipmentId)
+  const groupIds = groups.map((g) => g.id);
+  const { data: items } = await supabase
+    .from("consolidation_items")
+    .select("group_id, package_id, shipment_packages!inner(weight)")
+    .in("group_id", groupIds);
+
+  const shipmentIds = groups
+    .map((g) => g.shipment_id)
     .filter((id): id is string => Boolean(id));
-  if (linkedIds.length > 0) {
-    const shipmentRows = await db
-      .select({ id: shipments.id, trackingNumber: shipments.trackingNumber })
-      .from(shipments)
-      .where(and(inArray(shipments.id, linkedIds), eq(shipments.customerId, customerId)));
-    for (const row of shipmentRows) shipmentRefs.set(row.id, row.trackingNumber);
+  const trackingByShipment = new Map<string, string>();
+  if (shipmentIds.length > 0) {
+    const { data } = await supabase
+      .from("shipments")
+      .select("id, tracking_number")
+      .in("id", shipmentIds)
+      .eq("customer_id", customerId);
+    for (const s of data ?? []) trackingByShipment.set(s.id, s.tracking_number);
   }
 
   const perGroup = new Map<string, { count: number; weight: number }>();
-  for (const item of items) {
-    const entry = perGroup.get(item.groupId) ?? { count: 0, weight: 0 };
+  for (const item of items ?? []) {
+    const pkg = item.shipment_packages as unknown as { weight: unknown } | null;
+    const entry = perGroup.get(item.group_id) ?? { count: 0, weight: 0 };
     entry.count += 1;
-    entry.weight += item.weight ? Number(item.weight) : 0;
-    perGroup.set(item.groupId, entry);
+    entry.weight += pkg?.weight ? Number(pkg.weight) : 0;
+    perGroup.set(item.group_id, entry);
   }
 
   return groups.map((group) => {
     const stats = perGroup.get(group.id) ?? { count: 0, weight: 0 };
     return {
       id: group.id,
-      groupReference: group.groupReference,
+      groupReference: group.group_code,
       status: group.status,
-      shipmentId: group.shipmentId,
-      shipmentTrackingNumber: group.shipmentId
-        ? (shipmentRefs.get(group.shipmentId) ?? null)
+      shipmentId: group.shipment_id,
+      shipmentTrackingNumber: group.shipment_id
+        ? trackingByShipment.get(group.shipment_id) ?? null
         : null,
       notes: group.notes,
-      createdAt: group.createdAt,
+      createdAt: group.created_at,
       packageCount: stats.count,
       totalWeight: stats.count > 0 ? stats.weight.toFixed(3) : null,
     };
@@ -261,8 +233,8 @@ export type NotificationView = {
   message: string;
   notificationType: string;
   link: string | null;
-  readAt: Date | null;
-  createdAt: Date;
+  readAt: string | null;
+  createdAt: string;
 };
 
 export async function listNotifications(
@@ -275,55 +247,57 @@ export async function listNotifications(
   totalPages: number;
   unreadCount: number;
 }> {
-  const db = await getDb();
+  const supabase = await createClient();
   const page = Math.max(1, options.page ?? 1);
   const perPage = Math.max(1, Math.min(50, options.perPage ?? 20));
+  const from = (page - 1) * perPage;
 
-  const where = options.unreadOnly
-    ? and(eq(notifications.customerId, customerId), sql`${notifications.readAt} IS NULL`)
-    : eq(notifications.customerId, customerId);
+  const base = supabase.from("notifications").select("id", { count: "exact", head: true })
+    .eq("customer_id", customerId);
+  if (options.unreadOnly) base.is("read_at", null);
 
-  const totalRows = await db.select({ value: count() }).from(notifications).where(where);
-  const total = Number(totalRows[0]?.value ?? 0);
+  const rowsQuery = supabase
+    .from("notifications")
+    .select("id, title, message, notification_type, link, read_at, created_at")
+    .eq("customer_id", customerId);
+  if (options.unreadOnly) rowsQuery.is("read_at", null);
+  rowsQuery.order("created_at", { ascending: false }).range(from, from + perPage - 1);
 
-  const rows = await db
-    .select({
-      id: notifications.id,
-      title: notifications.title,
-      message: notifications.message,
-      notificationType: notifications.notificationType,
-      link: notifications.link,
-      readAt: notifications.readAt,
-      createdAt: notifications.createdAt,
-    })
-    .from(notifications)
-    .where(where)
-    .orderBy(desc(notifications.createdAt))
-    .limit(perPage)
-    .offset((page - 1) * perPage);
+  const unreadQuery = supabase
+    .from("notifications")
+    .select("id", { count: "exact", head: true })
+    .eq("customer_id", customerId)
+    .is("read_at", null);
 
-  const unreadRows = await db
-    .select({ value: count() })
-    .from(notifications)
-    .where(and(eq(notifications.customerId, customerId), sql`${notifications.readAt} IS NULL`));
+  const [countRes, rowsRes, unreadRes] = await Promise.all([base, rowsQuery, unreadQuery]);
+  const total = countRes.count ?? 0;
 
   return {
-    rows,
+    rows: (rowsRes.data ?? []).map((n) => ({
+      id: n.id,
+      title: n.title,
+      message: n.message,
+      notificationType: n.notification_type ?? "info",
+      link: n.link,
+      readAt: n.read_at,
+      createdAt: n.created_at,
+    })),
     total,
     page,
     totalPages: Math.max(1, Math.ceil(total / perPage)),
-    unreadCount: Number(unreadRows[0]?.value ?? 0),
+    unreadCount: unreadRes.count ?? 0,
   };
 }
 
 /** Lightweight count for the sidebar / topbar bell. */
 export async function getUnreadNotificationCount(customerId: string): Promise<number> {
-  const db = await getDb();
-  const rows = await db
-    .select({ value: count() })
-    .from(notifications)
-    .where(and(eq(notifications.customerId, customerId), sql`${notifications.readAt} IS NULL`));
-  return Number(rows[0]?.value ?? 0);
+  const supabase = await createClient();
+  const { count } = await supabase
+    .from("notifications")
+    .select("id", { count: "exact", head: true })
+    .eq("customer_id", customerId)
+    .is("read_at", null);
+  return count ?? 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -338,27 +312,29 @@ export type TicketView = {
   status: string;
   priority: string;
   reply: string | null;
-  repliedAt: Date | null;
-  createdAt: Date;
+  repliedAt: string | null;
+  createdAt: string;
 };
 
 export async function listSupportTickets(customerId: string): Promise<TicketView[]> {
-  const db = await getDb();
-  return db
-    .select({
-      id: supportTickets.id,
-      ticketNumber: supportTickets.ticketNumber,
-      subject: supportTickets.subject,
-      description: supportTickets.description,
-      status: supportTickets.status,
-      priority: supportTickets.priority,
-      reply: supportTickets.reply,
-      repliedAt: supportTickets.repliedAt,
-      createdAt: supportTickets.createdAt,
-    })
-    .from(supportTickets)
-    .where(eq(supportTickets.customerId, customerId))
-    .orderBy(desc(supportTickets.createdAt));
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("support_tickets")
+    .select("id, ticket_number, subject, description, status, priority, reply, replied_at, created_at")
+    .eq("customer_id", customerId)
+    .order("created_at", { ascending: false });
+
+  return (data ?? []).map((t) => ({
+    id: t.id,
+    ticketNumber: t.ticket_number,
+    subject: t.subject,
+    description: t.description,
+    status: t.status,
+    priority: t.priority,
+    reply: t.reply,
+    repliedAt: t.replied_at,
+    createdAt: t.created_at,
+  }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -372,26 +348,30 @@ export type ClaimView = {
   description: string | null;
   requestStatus: string;
   reviewNote: string | null;
-  createdAt: Date;
-  reviewedAt: Date | null;
+  createdAt: string;
+  reviewedAt: string | null;
 };
 
 export async function listCustomerClaims(customerId: string): Promise<ClaimView[]> {
-  const db = await getDb();
-  return db
-    .select({
-      id: shipmentClaimRequests.id,
-      shipmentTrackingNumber: shipmentClaimRequests.shipmentTrackingNumber,
-      carrierTrackingNumber: shipmentClaimRequests.carrierTrackingNumber,
-      description: shipmentClaimRequests.description,
-      requestStatus: shipmentClaimRequests.requestStatus,
-      reviewNote: shipmentClaimRequests.reviewNote,
-      createdAt: shipmentClaimRequests.createdAt,
-      reviewedAt: shipmentClaimRequests.reviewedAt,
-    })
-    .from(shipmentClaimRequests)
-    .where(eq(shipmentClaimRequests.customerId, customerId))
-    .orderBy(desc(shipmentClaimRequests.createdAt));
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("shipment_claim_requests")
+    .select(
+      "id, shipment_tracking_number, carrier_tracking_number, description, request_status, review_note, created_at, reviewed_at",
+    )
+    .eq("customer_id", customerId)
+    .order("created_at", { ascending: false });
+
+  return (data ?? []).map((c) => ({
+    id: c.id,
+    shipmentTrackingNumber: c.shipment_tracking_number,
+    carrierTrackingNumber: c.carrier_tracking_number,
+    description: c.description,
+    requestStatus: c.request_status,
+    reviewNote: c.review_note,
+    createdAt: c.created_at,
+    reviewedAt: c.reviewed_at,
+  }));
 }
 
 /** True when the customer already has an open claim for this tracking number. */
@@ -399,17 +379,14 @@ export async function hasOpenClaim(
   customerId: string,
   trackingNumber: string,
 ): Promise<boolean> {
-  const db = await getDb();
-  const rows = await db
-    .select({ id: shipmentClaimRequests.id })
-    .from(shipmentClaimRequests)
-    .where(
-      and(
-        eq(shipmentClaimRequests.customerId, customerId),
-        eq(shipmentClaimRequests.shipmentTrackingNumber, trackingNumber),
-        inArray(shipmentClaimRequests.requestStatus, ["pending", "auto_verified"]),
-      ),
-    )
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("shipment_claim_requests")
+    .select("id")
+    .eq("customer_id", customerId)
+    .eq("shipment_tracking_number", trackingNumber)
+    .in("request_status", ["pending"])
     .limit(1);
-  return rows.length > 0;
+
+  return (data ?? []).length > 0;
 }

@@ -18,13 +18,13 @@ export const metadata = { title: "عمليات المستودع" };
 
 const STATUS_TABS = [
   { label: "الكل", value: "all" },
+  { label: "بانتظار التسجيل", value: "awaiting_identification" },
   { label: "مسجّل", value: "registered" },
   { label: "مستلم", value: "received" },
-  { label: "جاهز للتجميع", value: "ready" },
+  { label: "جاهز للتجميع", value: "assigned" },
   { label: "مُجمّع", value: "consolidated" },
-  { label: "قيد الشحن", value: "in_transit" },
+  { label: "قيد الشحن", value: "shipped" },
   { label: "تم التسليم", value: "delivered" },
-  { label: "استثناء", value: "exception" },
 ];
 
 type Search = { q?: string; status?: string; page?: string };

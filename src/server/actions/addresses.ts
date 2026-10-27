@@ -1,14 +1,10 @@
 "use server";
 
-import { randomUUID } from "node:crypto";
-
-import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { withTransaction } from "@/db/client";
-import { customerAddresses } from "@/db/schema";
 import type { ActionState } from "@/lib/action-state";
 import { addressSchema, fieldErrors } from "@/lib/validation";
+import { createClient } from "@/lib/supabase/server";
 import { logAudit } from "@/server/audit";
 import { requireCustomerAction } from "@/server/auth/guards";
 import {
@@ -46,7 +42,6 @@ export async function saveAddressAction(
   const raw = readForm(formData);
   const parsed = addressSchema.safeParse(raw);
   if (!parsed.success) {
-    // Echo back only string values so the form can re-fill on validation failure.
     const echo: Record<string, string> = Object.fromEntries(
       Object.entries(raw).map(([key, value]) => [key, String(value)]),
     );
@@ -61,53 +56,44 @@ export async function saveAddressAction(
   const total = await countAddresses(session.profileId);
   const makeDefault = parsed.data.isDefault || total === 0;
 
+  const supabase = await createClient();
   try {
-    await withTransaction(async (tx) => {
-      if (makeDefault) {
-        await tx
-          .update(customerAddresses)
-          .set({ isDefault: false, updatedAt: new Date() })
-          .where(eq(customerAddresses.customerId, session.profileId));
-      }
+    // Clear any existing default first (DB also enforces one default per customer).
+    if (makeDefault) {
+      await supabase
+        .from("customer_addresses")
+        .update({ is_default: false })
+        .eq("customer_id", session.profileId);
+    }
 
-      if (existing) {
-        await tx
-          .update(customerAddresses)
-          .set({ ...addressToValues(parsed.data), isDefault: makeDefault, updatedAt: new Date() })
-          .where(
-            and(
-              eq(customerAddresses.id, existing.id),
-              eq(customerAddresses.customerId, session.profileId),
-            ),
-          );
-        await logAudit(
-          {
-            actorId: session.profileId,
-            actorLabel: session.fullName,
-            action: "address.updated",
-            entityType: "customer_address",
-            entityId: existing.id,
-          },
-          tx,
-        );
-      } else {
-        await tx.insert(customerAddresses).values({
-          id: randomUUID(),
-          customerId: session.profileId,
-          ...addressToValues(parsed.data),
-          isDefault: makeDefault,
-        });
-        await logAudit(
-          {
-            actorId: session.profileId,
-            actorLabel: session.fullName,
-            action: "address.created",
-            entityType: "customer_address",
-          },
-          tx,
-        );
-      }
-    });
+    if (existing) {
+      const { error } = await supabase
+        .from("customer_addresses")
+        .update({ ...addressToValues(parsed.data), is_default: makeDefault })
+        .eq("id", existing.id)
+        .eq("customer_id", session.profileId);
+      if (error) throw new Error(error.message);
+      await logAudit({
+        actorId: session.profileId,
+        actorLabel: session.fullName,
+        action: "address.updated",
+        entityType: "customer_address",
+        entityId: existing.id,
+      });
+    } else {
+      const { error } = await supabase.from("customer_addresses").insert({
+        customer_id: session.profileId,
+        ...addressToValues(parsed.data),
+        is_default: makeDefault,
+      });
+      if (error) throw new Error(error.message);
+      await logAudit({
+        actorId: session.profileId,
+        actorLabel: session.fullName,
+        action: "address.created",
+        entityType: "customer_address",
+      });
+    }
   } catch (error) {
     console.error("[addresses] save failed", error);
     return { ok: false, message: "تعذّر حفظ العنوان. حاول مرة أخرى." };
@@ -125,30 +111,22 @@ export async function setDefaultAddressAction(formData: FormData): Promise<void>
   const address = await getAddress(session.profileId, id);
   if (!address) return;
 
-  await withTransaction(async (tx) => {
-    await tx
-      .update(customerAddresses)
-      .set({ isDefault: false, updatedAt: new Date() })
-      .where(eq(customerAddresses.customerId, session.profileId));
-    await tx
-      .update(customerAddresses)
-      .set({ isDefault: true, updatedAt: new Date() })
-      .where(
-        and(
-          eq(customerAddresses.id, address.id),
-          eq(customerAddresses.customerId, session.profileId),
-        ),
-      );
-    await logAudit(
-      {
-        actorId: session.profileId,
-        actorLabel: session.fullName,
-        action: "address.set_default",
-        entityType: "customer_address",
-        entityId: address.id,
-      },
-      tx,
-    );
+  const supabase = await createClient();
+  await supabase
+    .from("customer_addresses")
+    .update({ is_default: false })
+    .eq("customer_id", session.profileId);
+  await supabase
+    .from("customer_addresses")
+    .update({ is_default: true })
+    .eq("id", address.id)
+    .eq("customer_id", session.profileId);
+  await logAudit({
+    actorId: session.profileId,
+    actorLabel: session.fullName,
+    action: "address.set_default",
+    entityType: "customer_address",
+    entityId: address.id,
   });
 
   revalidatePath("/addresses");
@@ -178,26 +156,20 @@ export async function deleteAddressAction(
     };
   }
 
+  const supabase = await createClient();
   try {
-    await withTransaction(async (tx) => {
-      await tx
-        .delete(customerAddresses)
-        .where(
-          and(
-            eq(customerAddresses.id, address.id),
-            eq(customerAddresses.customerId, session.profileId),
-          ),
-        );
-      await logAudit(
-        {
-          actorId: session.profileId,
-          actorLabel: session.fullName,
-          action: "address.deleted",
-          entityType: "customer_address",
-          entityId: address.id,
-        },
-        tx,
-      );
+    const { error } = await supabase
+      .from("customer_addresses")
+      .delete()
+      .eq("id", address.id)
+      .eq("customer_id", session.profileId);
+    if (error) throw new Error(error.message);
+    await logAudit({
+      actorId: session.profileId,
+      actorLabel: session.fullName,
+      action: "address.deleted",
+      entityType: "customer_address",
+      entityId: address.id,
     });
   } catch (error) {
     console.error("[addresses] delete failed", error);

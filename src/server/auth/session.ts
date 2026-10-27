@@ -1,14 +1,21 @@
 import "server-only";
 
-import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { cache } from "react";
-import { and, eq, isNull } from "drizzle-orm";
-import { cookies, headers } from "next/headers";
+import { connection } from "next/server";
 
-import { getDb } from "@/db/client";
-import { profiles, sessions } from "@/db/schema";
 import type { AccountStatus, ProfileRole } from "@/db/schema";
+import { createClient } from "@/lib/supabase/server";
 
+/**
+ * The application-wide session shape.
+ *
+ * It is intentionally unchanged from the pre-Supabase implementation so that
+ * every guard, server action, and query keeps working while the *identity
+ * provider* underneath is now Supabase Auth.
+ *
+ * `profileId` is the Supabase Auth user id (`auth.users.id`), which is also the
+ * primary key of `public.profiles`.
+ */
 export type Session = {
   sessionId: string;
   profileId: string;
@@ -21,132 +28,98 @@ export type Session = {
   accountStatus: AccountStatus;
 };
 
-const COOKIE_NAME = process.env.SESSION_COOKIE_NAME ?? "wa_session";
-const TTL_DAYS = Number(process.env.SESSION_TTL_DAYS ?? 30);
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function maxAgeSeconds(): number {
-  return Math.max(60, TTL_DAYS * 24 * 60 * 60);
-}
+type ProfileRow = {
+  id: string;
+  customer_number: string | null;
+  full_name: string | null;
+  phone: string | null;
+  email: string | null;
+  city: string | null;
+  account_status: string | null;
+};
 
 /**
- * Resolves the current session from the httpOnly cookie.
- * Never exposes the raw token to the database layer (only its SHA-256 hash).
+ * Resolves the signed-in user from the Supabase session cookie and builds the
+ * app `Session`. The profile and role are read through the RLS-enforced client,
+ * so a user can only ever see their own row.
+ *
+ * Returns `null` for anonymous visitors and for suspended/closed accounts.
  */
 export const getSession = cache(async (): Promise<Session | null> => {
-  const cookieStore = await cookies();
-  const token = cookieStore.get(COOKIE_NAME)?.value;
-  if (!token) return null;
+  // Marks guarded routes as request-time so the Cache Components prerender pass
+  // never opens the database (see guards.ts for the full rationale).
+  await connection();
 
-  const db = await getDb();
-  const tokenHash = sha256(token);
+  const supabase = await createClient();
 
-  const rows = await db
-    .select({
-      sessionId: sessions.id,
-      profileId: sessions.profileId,
-      expiresAt: sessions.expiresAt,
-      revokedAt: sessions.revokedAt,
-      fullName: profiles.fullName,
-      phone: profiles.phone,
-      email: profiles.email,
-      city: profiles.city,
-      role: profiles.role,
-      customerNumber: profiles.customerNumber,
-      accountStatus: profiles.accountStatus,
-    })
-    .from(sessions)
-    .innerJoin(profiles, eq(sessions.profileId, profiles.id))
-    .where(and(eq(sessions.tokenHash, tokenHash), isNull(sessions.revokedAt)))
-    .limit(1);
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  const row = rows[0];
-  if (!row) return null;
+  if (!user) return null;
 
-  const now = new Date();
-  const expiresAt = new Date(row.expiresAt);
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= now.getTime()) {
-    return null;
-  }
-  if (row.accountStatus !== "active") {
-    return null;
-  }
+  const { data: profileRow } = await supabase
+    .from("profiles")
+    .select("id, customer_number, full_name, phone, email, city, account_status")
+    .eq("id", user.id)
+    .maybeSingle();
+
+  // Fallback for the rare case where profile provisioning has not completed yet
+  // (see `handle_new_user()` / `repair_missing_profiles()` in the migrations).
+  // We synthesise a minimal session from the Auth metadata rather than crash.
+  const meta = (user.user_metadata ?? {}) as Record<string, string | undefined>;
+  const profile: ProfileRow = {
+    id: user.id,
+    customer_number: profileRow?.customer_number ?? null,
+    full_name: profileRow?.full_name ?? meta.full_name ?? null,
+    phone: profileRow?.phone ?? meta.phone ?? null,
+    email: profileRow?.email ?? user.email ?? null,
+    city: profileRow?.city ?? meta.city ?? null,
+    account_status: profileRow?.account_status ?? "active",
+  };
+
+  // A user with no row in `user_roles` is a regular customer.
+  const { data: roleRows } = await supabase
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", user.id);
+
+  const role = (roleRows?.[0]?.role ?? "customer") as ProfileRole;
+
+  const accountStatus = (profile.account_status ?? "active") as AccountStatus;
+  if (accountStatus !== "active") return null;
 
   return {
-    sessionId: row.sessionId,
-    profileId: row.profileId,
-    role: row.role,
-    customerNumber: row.customerNumber,
-    fullName: row.fullName,
-    phone: row.phone,
-    email: row.email,
-    city: row.city,
-    accountStatus: row.accountStatus,
+    sessionId: user.id,
+    profileId: user.id,
+    role,
+    customerNumber: profile.customer_number ?? "—",
+    fullName: profile.full_name ?? "",
+    phone: profile.phone ?? "",
+    email: profile.email ?? null,
+    city: profile.city ?? "",
+    accountStatus,
   };
 });
 
-/** Creates a session and stores the raw token only in the browser cookie. */
-export async function createSession(profileId: string, userAgent?: string | null): Promise<void> {
-  const db = await getDb();
-  const token = randomBytes(32).toString("base64url");
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + maxAgeSeconds() * 1000);
-
-  await db.insert(sessions).values({
-    id: randomUUID(),
-    profileId,
-    tokenHash: sha256(token),
-    createdAt: now,
-    expiresAt,
-    lastSeenAt: now,
-    userAgent: userAgent ? userAgent.slice(0, 300) : null,
-  });
-
-  const cookieStore = await cookies();
-  cookieStore.set(COOKIE_NAME, token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    path: "/",
-    maxAge: maxAgeSeconds(),
-  });
-}
-
-/** Revokes every active session of a profile (logout, password reset, suspension). */
-export async function revokeSessions(profileId: string): Promise<void> {
-  const db = await getDb();
-  await db
-    .update(sessions)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(sessions.profileId, profileId), isNull(sessions.revokedAt)));
-}
-
-export async function destroySession(): Promise<void> {
-  const cookieStore = await cookies();
-  const token = cookieStore.get(COOKIE_NAME)?.value;
-  if (token) {
-    const db = await getDb();
-    await db
-      .update(sessions)
-      .set({ revokedAt: new Date() })
-      .where(eq(sessions.tokenHash, sha256(token)));
-  }
-  cookieStore.delete(COOKIE_NAME);
-}
-
 export async function getIpAddress(): Promise<string> {
-  const headerStore = await headers();
-  const forwarded = headerStore.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0]?.trim() ?? "unknown";
-  return headerStore.get("x-real-ip") ?? "unknown";
+  try {
+    const { headers } = await import("next/headers");
+    const headerStore = await headers();
+    const forwarded = headerStore.get("x-forwarded-for");
+    if (forwarded) return forwarded.split(",")[0]?.trim() ?? "unknown";
+    return headerStore.get("x-real-ip") ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 export async function getUserAgent(): Promise<string | null> {
-  const headerStore = await headers();
-  return headerStore.get("user-agent");
+  try {
+    const { headers } = await import("next/headers");
+    const headerStore = await headers();
+    return headerStore.get("user-agent");
+  } catch {
+    return null;
+  }
 }
-
-export { COOKIE_NAME };

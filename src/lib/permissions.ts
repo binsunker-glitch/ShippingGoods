@@ -70,7 +70,7 @@ const MATRIX: Record<ProfileRole, Permission[]> = {
     "claims.read",
     "payments.read",
   ],
-  support: [
+  customer_support: [
     "customers.read",
     "shipments.read",
     "claims.read",
@@ -78,7 +78,7 @@ const MATRIX: Record<ProfileRole, Permission[]> = {
     "support.read",
     "support.reply",
   ],
-  finance: [
+  finance_staff: [
     "customers.read",
     "shipments.read",
     "shipments.fees",
@@ -111,8 +111,8 @@ const STAFF_ROLES: ProfileRole[] = [
   "super_admin",
   "operations_manager",
   "warehouse_staff",
-  "support",
-  "finance",
+  "customer_support",
+  "finance_staff",
 ];
 
 /** Navigation shown in the admin console, filtered by the actor's role. */

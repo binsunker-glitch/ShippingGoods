@@ -18,9 +18,9 @@ const PACKAGE_TABS = [
   { label: "كل الطرود", value: "all" },
   { label: "مسجّل", value: "registered" },
   { label: "في المستودع", value: "received" },
-  { label: "جاهز للتجميع", value: "ready" },
+  { label: "جاهز للتجميع", value: "assigned" },
   { label: "مُجمّع", value: "consolidated" },
-  { label: "قيد الشحن", value: "in_transit" },
+  { label: "قيد الشحن", value: "shipped" },
   { label: "تم التسليم", value: "delivered" },
 ];
 

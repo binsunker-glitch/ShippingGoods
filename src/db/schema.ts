@@ -46,12 +46,12 @@ export const PROFILE_ROLES = [
   "super_admin",
   "operations_manager",
   "warehouse_staff",
-  "support",
-  "finance",
+  "customer_support",
+  "finance_staff",
 ] as const;
 export type ProfileRole = (typeof PROFILE_ROLES)[number];
 
-export const ACCOUNT_STATUSES = ["active", "suspended"] as const;
+export const ACCOUNT_STATUSES = ["active", "suspended", "closed"] as const;
 export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 
 export const profiles = pgTable(
@@ -213,13 +213,13 @@ export const shipmentStatusTransitions = pgTable(
 /* ------------------------------------------------------------------ */
 
 export const PACKAGE_STATUSES = [
-  "registered",
+  "awaiting_identification",
   "received",
-  "ready",
+  "registered",
+  "assigned",
   "consolidated",
-  "in_transit",
+  "shipped",
   "delivered",
-  "exception",
 ] as const;
 export type PackageStatus = (typeof PACKAGE_STATUSES)[number];
 
@@ -402,7 +402,7 @@ export const consolidationItems = pgTable(
 /* Payments                                                            */
 /* ------------------------------------------------------------------ */
 
-export const PAYMENT_ROWS_STATUSES = ["pending", "completed", "failed", "refunded"] as const;
+export const PAYMENT_ROWS_STATUSES = ["pending", "verified", "failed", "refunded"] as const;
 
 export const shipmentPayments = pgTable(
   "shipment_payments",
@@ -430,7 +430,7 @@ export const shipmentPayments = pgTable(
 /* Shipment claim requests (ربط طرد)                                   */
 /* ------------------------------------------------------------------ */
 
-export const CLAIM_STATUSES = ["pending", "auto_verified", "approved", "rejected"] as const;
+export const CLAIM_STATUSES = ["pending", "approved", "rejected", "cancelled"] as const;
 export type ClaimStatus = (typeof CLAIM_STATUSES)[number];
 
 export const shipmentClaimRequests = pgTable(

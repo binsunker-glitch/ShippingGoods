@@ -69,11 +69,12 @@ export const registerSchema = z
     email: z
       .string()
       .trim()
+      .min(1, "البريد الإلكتروني مطلوب")
       .max(200, "البريد الإلكتروني طويل جداً")
-      .refine((value) => value === "" || z.email().safeParse(value).success, {
+      .refine((value) => z.email().safeParse(value).success, {
         message: "صيغة البريد الإلكتروني غير صحيحة",
       })
-      .transform((value) => (value === "" ? null : value.toLowerCase())),
+      .transform((value) => value.toLowerCase()),
     city: z.string().trim().min(1, "اختر المدينة").max(80),
     district: z.string().trim().min(1, "الحي مطلوب").max(80),
     street: z.string().trim().min(1, "الشارع مطلوب").max(120),
