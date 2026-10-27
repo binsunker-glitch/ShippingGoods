@@ -63,7 +63,7 @@ src/lib/supabase/        supabase-js browser / SSR clients + env checks
 src/server/queries/      read paths (supabase-js, aliased selects)
 src/server/actions/      Server Actions (Zod → RPCs / RLS-guarded writes)
 src/server/auth/         session + route/action guards
-middleware.ts            cookie refresh + auth redirects (edge)
+src/proxy.ts             cookie refresh + auth redirects (Next 16 proxy convention)
 tests/                   unit tests (format, permissions, rate-limit, validation)
 ```
 
@@ -182,7 +182,7 @@ Manual equivalent: **Vercel → Add New → Import Git Repository** → select
   sign-up. Suspended accounts (`profiles.account_status ≠ 'active'`) get
   `null` from `getSession()` on every request, which kills all live sessions.
 - **Session** — `@supabase/ssr` stores the Supabase session in `httpOnly`
-  cookies; `middleware.ts` refreshes tokens and redirects anonymous visitors.
+  cookies; `src/proxy.ts` refreshes tokens and redirects anonymous visitors.
 - **RLS** — deny-by-default on all 18 tables. Customers read only their own
   rows; staff writes are role-scoped policies; audit/notifications go through
   `SECURITY DEFINER` RPCs so ownership checks live in one place
