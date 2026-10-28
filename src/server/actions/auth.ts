@@ -143,6 +143,13 @@ export async function registerAction(
       };
     }
     console.error("[auth] signup failed", error.message);
+    if (msg.includes("rate limit") || msg.includes("too many requests")) {
+      return {
+        ok: false,
+        message: "تم تجاوز حدّ محاولات التسجيل المؤقت. انتظر نحو ساعة ثم أعد المحاولة.",
+        data: echo,
+      };
+    }
     return {
       ok: false,
       message: "تعذّر إنشاء الحساب حالياً. حاول مرة أخرى لاحقاً.",
@@ -228,6 +235,23 @@ export async function loginAction(
 
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
   if (error || !data.user) {
+    // Surface rate limits and unconfirmed emails instead of hiding them
+    // behind the generic "wrong credentials" message — they are not credential
+    // problems and the user cannot fix them by retyping the password.
+    const msg = error?.message?.toLowerCase() ?? "";
+    if (msg.includes("rate limit") || msg.includes("too many requests")) {
+      return {
+        ok: false,
+        message: "طلبات دخول كثيرة جداً. انتظر دقائق قليلة ثم أعد المحاولة.",
+      };
+    }
+    if (msg.includes("email not confirmed") || msg.includes("not confirmed")) {
+      return {
+        ok: false,
+        message:
+          "البريد الإلكتروني غير مُفعّل بعد. تحقّق من بريدك الوارد أو تواصل مع الإدارة لتفعيل الحساب.",
+      };
+    }
     return genericLoginError();
   }
 
